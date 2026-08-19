@@ -126,6 +126,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ContextPack"
         "400": {$ref: "#/components/responses/BadRequest"}
+        "409": {$ref: "#/components/responses/Conflict"}
   /v1/users/{user_id}:
     delete:
       operationId: forgetUser

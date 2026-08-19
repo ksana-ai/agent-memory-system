@@ -2,73 +2,109 @@
 
 ## System boundary
 
-This service owns cross-session user memory. It does not own an agent's current prompt, tool policy, skills, or run checkpoint. Those are Context Engineering and Harness concerns and may consume a Context Pack, but they do not become durable memory automatically.
+This service owns reviewed cross-session user memory. It does not own an agent's current prompt, tool policy, skills, or run checkpoint. Those Context Engineering and Harness components may consume a Context Pack, but their state does not become durable memory automatically.
 
-The first vertical slice uses ports and adapters:
+The current server runtime path is:
 
 ```text
 HTTP API
    │
    ▼
 Application service ─────► Retriever port ─────► BM25 adapter
-   │                              │
-   ▼                              ▼
-Store port ◄────────────── In-memory adapter
+   │                              │                    │
+   ▼                              ▼                    │
+Store port ──────────────► PostgreSQL adapter ◄────────┘
+                                  │
+                                  ▼
+                         Docker PostgreSQL 18
+                         + pgvector extension
 ```
 
-`internal/app` validates all scope and lifecycle transitions. The Store port repeats tenant and user scope on every lookup. A future PostgreSQL adapter must keep these filters in SQL; filtering after retrieval is not acceptable because private content would already have crossed the boundary.
+BM25 loads active cards from PostgreSQL on each search; it is not a separate materialized index. The in-memory Store adapter is retained for unit tests and deterministic offline evaluation only. The server binary has no memory fallback.
 
 ## Data layers
 
-### 1. Evidence
+### Evidence
 
-`EvidenceEvent` is the raw source: user, agent, or tool content associated with a tenant, user, and session. It is append-only during normal operation.
+`EvidenceEvent` is the raw source: user, agent, or tool content associated with a tenant, user, and session. It is append-only during normal operation. The explicit privacy-erasure path is the only implemented operation that removes it.
 
-Append-only auditability and privacy erasure are separate requirements. An authorized `ForgetUser` operation is the explicit exception: the Phase 0 adapter physically removes the content. A durable adapter must define deletion across primary storage, derived indexes, caches, and backups; it may preserve only a content-free deletion receipt.
+The PostgreSQL primary key is `(tenant_id, user_id, id)`, so a caller-chosen event ID can be reused safely in another scope. Candidate source links use a composite foreign key to prevent a cross-scope reference.
 
-### 2. Candidate
+### Candidate
 
-`MemoryCandidate` is an untrusted proposal. It carries:
+`MemoryCandidate` is an untrusted proposal. It carries a memory kind, Advanced-JSON-Card-style fields, extractor identity/version, metadata, and one or more ordered source event IDs. Creating it never makes it retrievable.
 
-- a memory kind (`episodic`, `semantic`, or `procedural`);
-- Advanced-JSON-Card-style fields (`person`, `relationship`, and `backstory`);
-- extractor identity and version;
-- one or more source event IDs;
-- a review status and decision record.
+The service performs an early source lookup for a useful API error. The PostgreSQL adapter repeats that validation while holding the scope transaction lock; correctness does not depend on the earlier check.
 
-The source events must exist in the same tenant/user scope. Creation alone never makes a candidate retrievable.
+### Memory card
 
-### 3. Memory card
-
-Approval creates a `MemoryCard`. Its identity is the tuple:
+Approval creates a `MemoryCard`. Its identity is the normalized tuple:
 
 ```text
 (kind, category, key, person, relationship)
 ```
 
-Identity fields are trimmed and case-folded before comparison. Approving another candidate with the same normalized identity supersedes the active version and creates version `n+1`. This is deterministic Last-Approved-Wins behavior, not semantic conflict resolution. Later phases must support “both valid under different conditions” and “unresolved conflict” states rather than always collapsing to one value.
+Go trims and lowercases each field. A length-delimited SHA-256 key addresses the identity chain, while the normalized fields are also stored under `C` collation and protected by a natural unique constraint. PostgreSQL locale-specific `lower()` is deliberately not used, avoiding Go/database normalization drift.
 
-### 4. Context Pack
+Approving another candidate with the same identity supersedes the active version and creates version `n+1`. This is deterministic last-approved-wins behavior, not semantic conflict resolution.
 
-A Context Pack is a request-scoped projection, not another persistent memory type. It contains ranked active cards and their source evidence. The calling agent is responsible for prompt ordering, token budgets, truncation, and instruction/data separation.
+### Context Pack
+
+A Context Pack is a request-scoped projection, not another persistent memory type. It contains ranked active cards and their ordered source evidence. The calling agent remains responsible for prompt ordering, token budgets, truncation, and instruction/data separation.
+
+## Transaction and lock model
+
+`agent_memory.user_scope_state` is both a persistent context revision and the first lock acquired by every write for `(tenant_id, user_id)`. The row survives erasure, preventing revision ABA after the user later creates new data.
+
+Candidate creation runs in one transaction:
+
+1. Upsert and lock the scope state row.
+2. Revalidate every source event in the same scope.
+3. Insert the pending candidate and its ordered source links.
+4. Commit all rows together.
+
+Candidate approval runs in one transaction:
+
+1. Lock the scope state row, then the scoped pending candidate.
+2. Revalidate source evidence.
+3. Insert or lock the normalized identity chain.
+4. Compute the next version and a timestamp strictly later than the prior version.
+5. Supersede the current active card, if any.
+6. Insert the new active card and advance the identity chain.
+7. Mark the candidate approved and increment the context revision.
+8. Commit.
+
+Rejection updates only the candidate and does not advance the retrieval revision. The database adds unique constraints for identity/version and a partial unique index allowing only one active card per identity. Concurrent tests cover two reviewers of one candidate, two candidates for one identity, a failure after superseding but before inserting, and approval racing erasure.
+
+## Erasure and read consistency
+
+`ForgetUser` holds the same scope lock and deletes, in one transaction:
+
+1. every active and superseded memory card;
+2. identity chains;
+3. pending, rejected, and approved candidates plus source links;
+4. evidence events;
+5. then increments the retained revision and records `last_deleted_at`.
+
+Because BM25 reads PostgreSQL directly, deletion reaches the current retrieval path at commit; there is no asynchronous projection to lag. The process integration test proves data is not returned after the DELETE response and remains absent after another server restart. Other tenant/user scopes are retained as controls.
+
+`BuildContext` compares the scope revision before and after its multi-statement retrieval and retries when it observes a concurrent change. This is an optimistic consistency guard, not a single serializable read transaction. The current propagation guarantee applies to requests begun after erasure commits; an HTTP request already in flight at commit is not proven to be a linearizable privacy barrier.
+
+No external vector index exists yet, so this phase cannot claim distributed index deletion. PostgreSQL backups and point-in-time recovery retention also need a separate erasure policy before production use.
+
+## Migrations and runtime
+
+Docker Compose pins `pgvector/pgvector:0.8.6-pg18-bookworm`, binds PostgreSQL to loopback, uses explicit development credentials, checks readiness with `pg_isready`, and mounts the PostgreSQL 18 data root at `/var/lib/postgresql`.
+
+Versioned SQL is embedded into both `cmd/migrate` and `cmd/server`. Tern applies each migration transactionally and serializes concurrent migrators with an advisory lock. Migrations do not rely on `/docker-entrypoint-initdb.d`, so an existing named volume can be upgraded.
+
+The initial migration installs pgvector but intentionally creates no embedding column or ANN index. Vector dimensions and distance semantics must follow a measured embedding choice, not precede one.
 
 ## Trust boundaries
 
-- `X-Tenant-ID` and `X-User-ID` are scope inputs in Phase 0, not proof of identity. The service is local-only until an authenticated principal is mapped to these values.
+- `X-Tenant-ID` and `X-User-ID` are scope inputs, not authentication credentials. Loopback binding reduces exposure but is not authorization.
+- The reviewer ID and reason are audit fields supplied by the caller; reviewer independence is not verified.
 - Extracted content is data, never an instruction to execute tools.
-- A reviewer records a decision but is not yet cryptographically authenticated.
-- The in-memory store gives process-level atomicity only. It does not prove crash consistency or distributed isolation.
-- Retrieval scores are implementation details and must not be interpreted as truth confidence.
-
-## Planned durable transaction
-
-The PostgreSQL approval path should run in one transaction:
-
-1. Lock the pending candidate in its tenant/user scope.
-2. Recheck every source event and policy decision.
-3. Lock the current active card for the identity.
-4. Mark it superseded, if present.
-5. Insert the next version and an outbox event.
-6. Commit; only then update derived FTS/vector indexes.
-
-An outbox consumer makes indexes rebuildable projections rather than sources of truth.
+- Database constraints and scoped SQL are the enforcement layer; prompt instructions are not a security boundary.
+- `/healthz` proves only that the process is alive. `/readyz` separately pings PostgreSQL.
+- Retrieval scores are lexical ranking values, not truth confidence.

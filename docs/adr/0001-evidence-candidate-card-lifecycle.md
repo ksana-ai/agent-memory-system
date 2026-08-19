@@ -1,6 +1,6 @@
 # ADR 0001: Separate evidence, candidates, and serviceable memory
 
-- Status: accepted for Phase 0
+- Status: accepted
 - Date: 2026-08-19
 
 ## Context
@@ -22,7 +22,7 @@ Every card is linked to its candidate and source evidence. Candidate approval is
 Benefits:
 
 - Retrieval cannot silently serve unreviewed model output.
-- Each serviceable card can be traced back to source content; persistence is deferred to the durable adapter.
+- Each serviceable card can be traced back to source content; PostgreSQL enforces scoped links and transactional promotion.
 - Extractor and reviewer versions can be evaluated independently.
 - Derived indexes can be rebuilt from reviewed cards.
 

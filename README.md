@@ -1,14 +1,12 @@
 # Go Agent Memory System
 
-A Go-native, evidence-first memory service for agents. The project separates immutable conversation evidence, untrusted memory proposals, reviewed/versioned memory cards, and the context assembled for one request.
+A Go-native, evidence-first memory service for agents. It separates raw conversation evidence, untrusted memory proposals, reviewed/versioned memory cards, and the Context Pack assembled for one request.
 
-> **Current status: Phase 0 walking skeleton.** The lifecycle and its safety invariants run locally with an in-memory store and a deterministic BM25 baseline. PostgreSQL/pgvector, real model extraction, authentication, PII redaction, and production observability are not implemented yet.
+> **Current status: durable PostgreSQL vertical slice.** The server binary uses PostgreSQL started by Docker Compose, applies embedded transactional migrations, and has real-process restart and deletion-propagation tests. Retrieval is still deterministic BM25 over active PostgreSQL cards. The pgvector extension is installed for the next retrieval phase, but embeddings and vector search are not implemented.
 
 ## Why this project exists
 
 An agent checkpoint answers “where should this run resume?” Agent memory answers a different question: “which reviewed facts from earlier sessions are relevant now, and what evidence supports them?” Treating those as the same system makes unverified model output look like durable truth.
-
-This repository implements the lifecycle explicitly:
 
 ```mermaid
 flowchart LR
@@ -16,46 +14,77 @@ flowchart LR
     C --> R{Explicit review}
     R -->|reject| X[Not serviceable]
     R -->|approve| M[Versioned memory card]
-    M --> S[Scoped retrieval]
+    M --> S[Scoped BM25 retrieval]
     E --> P[Context Pack with sources]
     S --> P
 ```
 
-The core invariants are:
+The implemented invariants are:
 
 - A candidate is never retrievable before explicit approval.
-- Every candidate references source evidence in the same tenant and user scope.
-- Approving the same memory identity creates a new active version and supersedes the old one.
-- Every lookup is scoped by both `tenant_id` and `user_id`.
-- A Context Pack returns memory cards and the source evidence needed to audit them.
-- Explicit user erasure removes evidence, candidates, and serviceable memories in the current adapter.
+- Every candidate references source evidence in the same tenant/user scope.
+- Approval atomically reviews the candidate, supersedes the prior active identity, inserts version `n+1`, and advances the scope revision.
+- PostgreSQL keys, foreign keys, and queries carry both `tenant_id` and `user_id`.
+- A Context Pack returns active cards with the source evidence needed to audit them.
+- User erasure transactionally removes evidence, candidates, identity chains, and every card version while retaining a monotonic, content-free revision row.
 
-## What is implemented
+## Evidence and boundaries
 
-| Capability | Current evidence | Boundary |
+| Capability | Executable evidence | Current boundary |
 | --- | --- | --- |
-| Evidence → candidate → review → memory lifecycle | Service and HTTP integration tests | In-memory only |
-| Conflict versioning | A new approved value supersedes the prior active card | No merge or human-review UI yet |
-| Tenant/user isolation | Cross-scope source and retrieval tests | Scope headers are not authentication |
-| Context Pack with source back-links | API returns ranked cards plus evidence | Lexical retrieval only |
-| User erasure | Test asserts no later retrieval and no source lookup | No distributed deletion or backup policy yet |
-| Offline evaluation manifest | Versioned 8-case synthetic smoke dataset, SHA-256, per-case ranks | Not a production benchmark or model evaluation |
+| Evidence → candidate → review → memory | Unit, HTTP, and real PostgreSQL contract tests | Reviewer ID is caller-supplied; no authentication yet |
+| Transactional conflict versioning | Concurrent approvals produce v1/v2 with one active card; failure-in-the-middle rolls back | Last-approved-wins, not semantic conflict resolution |
+| Tenant/user isolation | Composite database constraints plus cross-scope tests | Scope headers are selectors, not proof of identity |
+| Restart recovery | Test starts, SIGTERMs, and restarts the actual server binary against one Docker volume | No backup/restore drill yet |
+| Deletion propagation | DELETE commits, BM25 returns nothing, a third server process still sees nothing, and database tables are inspected | Covers PostgreSQL and the live BM25 path; there is no external vector index or backup deletion policy |
+| Offline evaluation | Versioned 8-case synthetic dataset, SHA-256, ranks, Recall@K, and MRR | Uses the in-memory adapter for determinism; not a production benchmark |
+| pgvector | Docker image and migration create extension `vector` | No vector column, embedding model, ANN index, or vector query yet |
 
-## Run it
+The in-memory adapter remains only for fast unit tests and deterministic offline evaluation. `cmd/server` has no in-memory fallback and fails fast when PostgreSQL is unavailable.
 
-Requirements: Go 1.24+.
+## Run locally
+
+Requirements:
+
+- Go 1.25+
+- Docker Engine with Docker Compose
+
+Start PostgreSQL, apply the same embedded migration used by the server, and run all Docker-backed integration tests:
 
 ```bash
 make verify
-go run ./cmd/server -addr 127.0.0.1:8080
+make verify-postgres
 ```
 
-The server intentionally uses no external dependency in Phase 0 and binds only to loopback by default. Data is lost when the process exits.
+`make verify-postgres` leaves the healthy PostgreSQL container and its named volume running. Start the API on loopback:
+
+```bash
+make server
+```
+
+Check process liveness and database readiness separately:
+
+```bash
+curl -sS http://127.0.0.1:8080/healthz
+curl -sS http://127.0.0.1:8080/readyz
+```
+
+Stop the container without deleting data:
+
+```bash
+make db-down
+```
+
+Docker Compose uses `pgvector/pgvector:0.8.6-pg18-bookworm`, binds PostgreSQL only to `127.0.0.1:55432`, and stores data in `go-agent-memory-system_postgres-data`. Running `docker compose down --volumes` permanently deletes that development volume.
+
+The default development credentials are listed in `.env.example`. Make does not load `.env`; pass overrides through the shell or on the Make command line. It exports `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_PORT` to Compose and derives the default DSN without printing it. A complete `DATABASE_URL`/`TEST_DATABASE_URL` can also be supplied. Changing initialization credentials does not rewrite an existing PostgreSQL volume; recreating that disposable development volume is a separate, destructive operation.
+
+## Exercise the lifecycle
 
 ### 1. Append evidence
 
 ```bash
-curl -sS http://localhost:8080/v1/evidence \
+curl -sS http://127.0.0.1:8080/v1/evidence \
   -H 'Content-Type: application/json' \
   -H 'X-Tenant-ID: demo' \
   -H 'X-User-ID: user-1' \
@@ -70,7 +99,7 @@ curl -sS http://localhost:8080/v1/evidence \
 ### 2. Propose a memory candidate
 
 ```bash
-curl -sS http://localhost:8080/v1/memory-candidates \
+curl -sS http://127.0.0.1:8080/v1/memory-candidates \
   -H 'Content-Type: application/json' \
   -H 'X-Tenant-ID: demo' \
   -H 'X-User-ID: user-1' \
@@ -88,12 +117,13 @@ curl -sS http://localhost:8080/v1/memory-candidates \
   }'
 ```
 
-Copy the returned candidate ID into the review request. A pending candidate will not appear in retrieval.
+Copy the returned candidate ID into the review request. A pending candidate is not serviceable.
 
 ### 3. Review and promote it
 
 ```bash
-curl -sS http://localhost:8080/v1/memory-candidates/<candidate_id>/reviews \
+CANDIDATE_ID='replace-with-returned-candidate-id'
+curl -sS "http://127.0.0.1:8080/v1/memory-candidates/${CANDIDATE_ID}/reviews" \
   -H 'Content-Type: application/json' \
   -H 'X-Tenant-ID: demo' \
   -H 'X-User-ID: user-1' \
@@ -107,7 +137,7 @@ curl -sS http://localhost:8080/v1/memory-candidates/<candidate_id>/reviews \
 ### 4. Build a Context Pack
 
 ```bash
-curl -sS http://localhost:8080/v1/context-packs \
+curl -sS http://127.0.0.1:8080/v1/context-packs \
   -H 'Content-Type: application/json' \
   -H 'X-Tenant-ID: demo' \
   -H 'X-User-ID: user-1' \
@@ -116,44 +146,54 @@ curl -sS http://localhost:8080/v1/context-packs \
 
 The full HTTP contract is in [`api/openapi.yaml`](api/openapi.yaml).
 
-## Run the retrieval smoke evaluation
+## Verification commands
 
 ```bash
-make eval
+make verify             # format, vet, unit tests, race tests, build
+make verify-postgres    # Docker health, migration, PG contract + process tests
+make eval               # deterministic lexical smoke evaluation
+```
 
-# Optionally retain a machine-readable local run artifact.
-go run ./cmd/eval \
+The PostgreSQL test tag is intentionally strict: invoking it directly without `TEST_DATABASE_URL`, or invoking the process test without `TEST_SERVER_BINARY`, fails instead of silently skipping.
+
+To retain a local machine-readable evaluation run:
+
+```bash
+./bin/agent-memory-eval \
   -dataset ./datasets/retrieval-smoke-v1.json \
   -k 5 \
   -output ./artifacts/eval/latest.json
 ```
 
-The manifest records the dataset ID/version/hash, source revision state, Go version, retrieval arm, per-case rankings, Recall@K, MRR, and pass rate. The current dataset is deliberately small and synthetic; a perfect score only proves the local pipeline and metric plumbing work.
+The fixture is deliberately small and synthetic. A perfect score proves metric and retrieval plumbing on that fixture, not production retrieval quality.
 
-See [`docs/evaluation.md`](docs/evaluation.md) for metric semantics and the evidence boundary.
+See [`docs/architecture.md`](docs/architecture.md) for transaction boundaries and [`docs/evaluation.md`](docs/evaluation.md) for metric semantics and evidence levels.
 
 ## Repository layout
 
 ```text
-api/                    OpenAPI contract
-cmd/server/             HTTP service entry point
-cmd/eval/               Offline evaluation entry point
-datasets/               Versioned evaluation fixtures
-docs/                    Architecture, ADRs, and evaluation policy
-internal/api/           Strict HTTP/JSON boundary
-internal/app/           Memory lifecycle application service
-internal/domain/        Evidence, candidate, card, context, deletion types
-internal/retrieval/     Deterministic BM25 baseline
-internal/store/         Storage contract and in-memory adapter
+api/                         OpenAPI contract
+cmd/server/                  PostgreSQL-backed HTTP service and process test
+cmd/migrate/                 Explicit embedded-migration runner
+cmd/eval/                    Deterministic offline evaluation
+datasets/                    Versioned evaluation fixtures
+docs/                        Architecture, ADRs, and evaluation policy
+internal/api/                Strict HTTP/JSON boundary
+internal/app/                Memory lifecycle application service
+internal/domain/             Evidence, candidate, card, context, deletion types
+internal/migrations/         Tern runner and versioned SQL
+internal/retrieval/          Deterministic BM25 baseline
+internal/store/memstore/     Unit/evaluation test double
+internal/store/postgres/     Durable transactional adapter and contract tests
+compose.yaml                 Local PostgreSQL/pgvector service
 ```
 
 ## Roadmap
 
-1. **Evaluation gate:** grow the hard cases continuously toward approximately 60 multi-session cases; retain clean-revision manifests and compare each later retrieval arm on the same data.
-2. **Durable evidence layer:** PostgreSQL schema/migrations, transactional version promotion, restart and deletion tests.
-3. **Real retrieval:** PostgreSQL FTS + pgvector, reciprocal-rank fusion, reranking, and retrieval-level ACL enforcement.
-4. **Model pipeline:** structured extractor, evidence verifier, PII policy, asynchronous jobs, and human escalation.
-5. **Dual-layer memory:** Advanced JSON Cards for always-on facts plus contextual retrieval over raw conversations; compare no-memory, cards-only, RAG-only, and dual-layer arms.
-6. **Operations:** OpenTelemetry traces, redacted logging, rate limits, authentication/authorization, backups, and deletion receipts across derived indexes.
+1. Grow the evaluation gate toward roughly 60 multi-session hard cases and retain clean-revision manifests.
+2. Add PostgreSQL full-text search and one real embedding/pgvector retrieval arm, then compare them on the same dataset.
+3. Add reciprocal-rank fusion/reranking only if the measured baseline justifies it.
+4. Add authenticated principals, authorization, PII policy, rate limits, redacted observability, backup/restore, and backup-aware erasure.
+5. Add a structured model extractor and verifier with explicit human-escalation policy.
 
-Design details live in [`docs/architecture.md`](docs/architecture.md). Planned work must not be represented as completed or production-deployed capability.
+Planned work must not be represented as completed or production-deployed capability.

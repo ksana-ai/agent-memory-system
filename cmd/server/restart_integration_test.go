@@ -108,8 +108,8 @@ func startServer(t *testing.T, binary, databaseURL string) *runningServer {
 	}
 
 	logs := &synchronizedBuffer{}
-	command := exec.Command(binary, "-addr", address, "-database-url", databaseURL)
-	command.Env = os.Environ()
+	command := exec.Command(binary, "-addr", address)
+	command.Env = withEnvironmentVariable(os.Environ(), "DATABASE_URL", databaseURL)
 	command.Stdout = logs
 	command.Stderr = logs
 	if err := command.Start(); err != nil {
@@ -152,6 +152,18 @@ func startServer(t *testing.T, binary, databaseURL string) *runningServer {
 	running.terminateIfNeeded()
 	t.Fatalf("server did not become ready at %s\n%s", running.baseURL, logs.String())
 	return nil
+}
+
+func withEnvironmentVariable(environ []string, key, value string) []string {
+	result := append([]string(nil), environ...)
+	prefix := key + "="
+	for index, current := range result {
+		if strings.HasPrefix(current, prefix) {
+			result[index] = prefix + value
+			return result
+		}
+	}
+	return append(result, prefix+value)
 }
 
 func (running *runningServer) stop(t *testing.T) {

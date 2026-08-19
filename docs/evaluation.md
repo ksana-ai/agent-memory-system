@@ -10,6 +10,8 @@
 
 The fixture is intentionally easy and uses deterministic, pre-authored memory cards. It does **not** evaluate LLM extraction, evidence verification, long-conversation chunking, embeddings, reranking, proactive reasoning, latency under load, token cost, or production traffic. Its metrics cannot support a résumé claim about production retrieval quality.
 
+The evaluation CLI deliberately uses the in-memory adapter so runs are fast and deterministic. This is separate from `cmd/server`, which requires PostgreSQL and has no in-memory fallback.
+
 ## Metrics
 
 - **Recall@K:** for each query, the fraction of gold memory keys present in the first `K` results; the manifest reports the macro average across cases.
@@ -22,11 +24,13 @@ Metrics are only comparable when dataset hash, `K`, retrieval arm, and code revi
 
 1. **Static contract:** code, schemas, and tests exist.
 2. **Local deterministic run:** the smoke dataset or unit tests were actually executed on a recorded revision.
-3. **Real component run:** PostgreSQL/pgvector and real models ran with versioned configuration and retained traces.
+3. **Real component run:** an actual external component ran with versioned configuration and retained output.
 4. **Controlled benchmark:** multiple ablation arms ran on the same held-out multi-session dataset, with uncertainty and bad-case analysis.
 5. **Production evidence:** observed, privacy-safe traffic metrics with deployment and sampling boundaries.
 
-The repository can produce a level-2 local run, but the current working tree has no clean revision or retained manifest artifact yet. Until that exists, results should be described as a rerun of an uncommitted local snapshot rather than recorded reproducible evidence.
+`make eval` can produce a level-2 retrieval run. It becomes recorded evidence only when the manifest names a clean source revision and the artifact is retained; console output from an arbitrary working tree is ephemeral.
+
+`make verify-postgres` is a real PostgreSQL component run: it checks migrations, transactions, restart recovery, and deletion propagation against the pinned Docker image. It does not exercise a vector column, vector query, embedding model, or LLM, so it is not evidence for pgvector retrieval or model quality merely because the extension is installed.
 
 ## Target benchmark
 

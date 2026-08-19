@@ -18,3 +18,8 @@ jobs:
           cache: true
       - name: Verify
         run: make verify
+      - name: Verify PostgreSQL lifecycle
+        run: make verify-postgres
+      - name: Stop PostgreSQL
+        if: always()
+        run: docker compose down --volumes
