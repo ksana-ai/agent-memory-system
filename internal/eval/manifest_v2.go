@@ -36,6 +36,19 @@ type SystemMetadataV2 struct {
 	MeasuredRuns            int    `json:"measured_runs"`
 	QueryTimeoutNanoseconds int64  `json:"query_timeout_nanoseconds"`
 	ConfigHash              string `json:"config_hash"`
+	// QualityUncertainty is additive within schema v2. Runner v2.1 is the
+	// first version that emits deterministic query-level confidence intervals.
+	QualityUncertainty QualityUncertaintyMetadataV2 `json:"quality_uncertainty"`
+}
+
+type QualityUncertaintyMetadataV2 struct {
+	Algorithm       string  `json:"algorithm"`
+	ConfidenceLevel float64 `json:"confidence_level"`
+	Resamples       int     `json:"resamples"`
+	Seed            uint64  `json:"seed"`
+	SamplingUnit    string  `json:"sampling_unit"`
+	Paired          bool    `json:"paired"`
+	Stratified      bool    `json:"stratified"`
 }
 
 type ArmResultV2 struct {
@@ -45,36 +58,51 @@ type ArmResultV2 struct {
 }
 
 type ArmAggregateV2 struct {
-	QueryCount                int     `json:"query_count"`
-	QualityQueryCount         int     `json:"quality_query_count"`
-	NonRecallQueryCount       int     `json:"non_recall_query_count"`
-	RecallAtK                 float64 `json:"recall_at_k"`
-	MRR                       float64 `json:"mrr"`
-	NDCGAtK                   float64 `json:"ndcg_at_k"`
-	PassRate                  float64 `json:"pass_rate"`
-	LatencyP50Nanoseconds     int64   `json:"latency_p50_nanoseconds"`
-	LatencyP95Nanoseconds     int64   `json:"latency_p95_nanoseconds"`
-	LatencyMaxNanoseconds     int64   `json:"latency_max_nanoseconds"`
-	LatencySampleCount        int     `json:"latency_sample_count"`
-	ForbiddenHits             int     `json:"forbidden_hits"`
-	RequireEmptyFailures      int     `json:"require_empty_failures"`
-	ScopeViolations           int     `json:"scope_violations"`
-	NonActiveHits             int     `json:"nonactive_hits"`
-	ExpiredHits               int     `json:"expired_hits"`
-	UnknownHits               int     `json:"unknown_hits"`
-	DuplicateHits             int     `json:"duplicate_hits"`
-	OverLimitHits             int     `json:"over_limit_hits"`
-	UnknownSourceIDs          int     `json:"unknown_source_ids"`
-	MissingSources            int     `json:"missing_sources"`
-	ReorderedSources          int     `json:"reordered_sources"`
-	SourceScopeViolations     int     `json:"source_scope_violations"`
-	MemoryPayloadViolations   int     `json:"memory_payload_violations"`
-	EvidencePayloadViolations int     `json:"evidence_payload_violations"`
-	QueryExecutionFailures    int     `json:"query_execution_failures"`
-	PolicyPassed              bool    `json:"policy_passed"`
-	PolicyPassRate            float64 `json:"policy_pass_rate"`
-	NonRecallPassRate         float64 `json:"non_recall_pass_rate"`
-	QualityResultSHA256       string  `json:"quality_result_sha256"`
+	QueryCount                int                 `json:"query_count"`
+	QualityQueryCount         int                 `json:"quality_query_count"`
+	NonRecallQueryCount       int                 `json:"non_recall_query_count"`
+	RecallAtK                 float64             `json:"recall_at_k"`
+	MRR                       float64             `json:"mrr"`
+	NDCGAtK                   float64             `json:"ndcg_at_k"`
+	PassRate                  float64             `json:"pass_rate"`
+	QualityIntervals          *QualityIntervalsV2 `json:"quality_intervals,omitempty"`
+	LatencyP50Nanoseconds     int64               `json:"latency_p50_nanoseconds"`
+	LatencyP95Nanoseconds     int64               `json:"latency_p95_nanoseconds"`
+	LatencyMaxNanoseconds     int64               `json:"latency_max_nanoseconds"`
+	LatencySampleCount        int                 `json:"latency_sample_count"`
+	ForbiddenHits             int                 `json:"forbidden_hits"`
+	RequireEmptyFailures      int                 `json:"require_empty_failures"`
+	ScopeViolations           int                 `json:"scope_violations"`
+	NonActiveHits             int                 `json:"nonactive_hits"`
+	ExpiredHits               int                 `json:"expired_hits"`
+	UnknownHits               int                 `json:"unknown_hits"`
+	DuplicateHits             int                 `json:"duplicate_hits"`
+	OverLimitHits             int                 `json:"over_limit_hits"`
+	UnknownSourceIDs          int                 `json:"unknown_source_ids"`
+	MissingSources            int                 `json:"missing_sources"`
+	ReorderedSources          int                 `json:"reordered_sources"`
+	SourceScopeViolations     int                 `json:"source_scope_violations"`
+	MemoryPayloadViolations   int                 `json:"memory_payload_violations"`
+	EvidencePayloadViolations int                 `json:"evidence_payload_violations"`
+	QueryExecutionFailures    int                 `json:"query_execution_failures"`
+	PolicyPassed              bool                `json:"policy_passed"`
+	PolicyPassRate            float64             `json:"policy_pass_rate"`
+	NonRecallPassRate         float64             `json:"non_recall_pass_rate"`
+	QualityResultSHA256       string              `json:"quality_result_sha256"`
+}
+
+type QualityIntervalsV2 struct {
+	RecallAtK ConfidenceIntervalV2 `json:"recall_at_k"`
+	MRR       ConfidenceIntervalV2 `json:"mrr"`
+	NDCGAtK   ConfidenceIntervalV2 `json:"ndcg_at_k"`
+	PassRate  ConfidenceIntervalV2 `json:"pass_rate"`
+}
+
+type ConfidenceIntervalV2 struct {
+	Estimate           float64 `json:"estimate"`
+	Lower              float64 `json:"lower"`
+	Upper              float64 `json:"upper"`
+	BoundaryDegenerate bool    `json:"boundary_degenerate"`
 }
 
 type QueryResultV2 struct {

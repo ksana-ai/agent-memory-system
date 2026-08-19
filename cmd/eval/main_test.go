@@ -93,7 +93,10 @@ func TestEvalPostgresDryRunDoesNotPutDatabaseURLInCommand(t *testing.T) {
 func TestEvalVectorDryRunDoesNotPutConnectionsInCommand(t *testing.T) {
 	const databaseURL = "postgres://eval-user:vector-database-secret@db.example.invalid/agent_memory"
 	const embeddingsURL = "http://127.0.0.1:1234/v1/embeddings/vector-endpoint-secret"
-	for _, target := range []string{"eval-vector", "eval-vector-recorded", "verify-vector"} {
+	for _, target := range []string{
+		"eval-vector", "eval-vector-recorded", "verify-vector",
+		"eval-semantic", "eval-semantic-recorded", "verify-semantic",
+	} {
 		command := exec.Command(
 			"make", "-n", target,
 			"TEST_DATABASE_URL="+databaseURL,

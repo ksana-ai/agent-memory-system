@@ -47,6 +47,10 @@ func TestRunV2ExecutesLifecycleForEveryArmAndSeparatesQualityFromPolicy(t *testi
 	if manifest.Dataset.Cases != 1 || manifest.Dataset.Queries != 3 || manifest.System.RetrievalDepth != 3 {
 		t.Fatalf("unexpected manifest metadata: %#v %#v", manifest.Dataset, manifest.System)
 	}
+	if manifest.SchemaVersion != ManifestSchemaVersionV2 || manifest.System.RunnerVersion != "evaluation-runner-v2.1" ||
+		manifest.System.QualityUncertainty != qualityUncertaintyMetadataV2() {
+		t.Fatalf("unexpected additive v2.1 uncertainty metadata: schema=%q system=%#v", manifest.SchemaVersion, manifest.System)
+	}
 	if len(manifest.Arms) != 2 {
 		t.Fatalf("arm count = %d, want 2", len(manifest.Arms))
 	}

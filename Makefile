@@ -19,12 +19,14 @@ export LMSTUDIO_EMBEDDINGS_URL LMSTUDIO_EMBEDDING_MODEL
 SERVER_BINARY := $(CURDIR)/bin/agent-memory-server
 EVAL_BINARY := $(CURDIR)/bin/agent-memory-eval
 EVAL_V2_DATASET := $(CURDIR)/datasets/memory-lifecycle-v2.json
+EVAL_SEMANTIC_V1_DATASET := $(CURDIR)/datasets/memory-semantic-extension-v1.json
 EVAL_V2_MANIFEST := $(CURDIR)/artifacts/eval/memory-lifecycle-v2-latest.json
 EVAL_POSTGRES_V2_MANIFEST := $(CURDIR)/artifacts/eval/memory-lifecycle-v2-postgres-fts-latest.json
 EVAL_VECTOR_V2_MANIFEST := $(CURDIR)/artifacts/eval/memory-lifecycle-v2-postgres-vector-latest.json
+EVAL_SEMANTIC_V1_MANIFEST := $(CURDIR)/artifacts/eval/memory-semantic-extension-v1-postgres-vector-latest.json
 GO_FILES := $(shell find . -path './.cache' -prune -o -path './.git' -prune -o -name '*.go' -type f -print)
 
-.PHONY: build build-eval build-server db-down db-up eval eval-postgres eval-postgres-recorded eval-recorded eval-v2 eval-vector eval-vector-recorded fmt fmt-check migrate server test test-integration test-race test-vector-integration verify verify-postgres verify-vector vet
+.PHONY: build build-eval build-server db-down db-up eval eval-postgres eval-postgres-recorded eval-recorded eval-semantic eval-semantic-recorded eval-v2 eval-vector eval-vector-recorded fmt fmt-check migrate semantic-frozen server test test-integration test-race test-vector-integration verify verify-postgres verify-semantic verify-vector vet
 
 build:
 	$(GO) build ./...
@@ -60,6 +62,15 @@ eval-vector: migrate build-eval
 
 eval-vector-recorded: migrate build-eval
 	@$(EVAL_BINARY) -dataset $(EVAL_V2_DATASET) -arms no-memory-v1,reviewed-cards-bm25-v1,reviewed-cards-postgres-fts-v1,reviewed-cards-postgres-vector-v1 -k 5 -ndcg-k 10 -warmup-runs 1 -measured-runs 3 -query-timeout 15s -require-policy-pass -require-clean -output $(EVAL_VECTOR_V2_MANIFEST) -quiet
+
+semantic-frozen:
+	@test -z "$$(git status --porcelain)" || { echo "semantic benchmark requires a clean frozen revision" >&2; exit 1; }
+
+eval-semantic: semantic-frozen migrate build-eval
+	@$(EVAL_BINARY) -dataset $(EVAL_SEMANTIC_V1_DATASET) -arms no-memory-v1,reviewed-cards-bm25-v1,reviewed-cards-postgres-fts-v1,reviewed-cards-postgres-vector-v1 -k 5 -ndcg-k 10 -warmup-runs 1 -measured-runs 1 -query-timeout 15s -require-policy-pass -require-clean -quiet
+
+eval-semantic-recorded: semantic-frozen migrate build-eval
+	@$(EVAL_BINARY) -dataset $(EVAL_SEMANTIC_V1_DATASET) -arms no-memory-v1,reviewed-cards-bm25-v1,reviewed-cards-postgres-fts-v1,reviewed-cards-postgres-vector-v1 -k 5 -ndcg-k 10 -warmup-runs 1 -measured-runs 3 -query-timeout 15s -require-policy-pass -require-clean -output $(EVAL_SEMANTIC_V1_MANIFEST) -quiet
 
 eval-recorded: build-eval
 	@$(EVAL_BINARY) -dataset $(EVAL_V2_DATASET) -arms no-memory-v1,reviewed-cards-bm25-v1 -k 5 -ndcg-k 10 -measured-runs 3 -query-timeout 5s -require-policy-pass -require-clean -output $(EVAL_V2_MANIFEST) -quiet
@@ -97,3 +108,5 @@ server: db-up
 verify-postgres: test-integration eval-postgres
 
 verify-vector: test-vector-integration eval-vector
+
+verify-semantic: test-vector-integration eval-semantic

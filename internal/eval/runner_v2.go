@@ -16,7 +16,7 @@ import (
 	"github.com/kai443/go-agent-memory-system/internal/domain"
 )
 
-const runnerVersionV2 = "evaluation-runner-v2"
+const runnerVersionV2 = "evaluation-runner-v2.1"
 
 // Timer is used only around Retriever.Search. The logical fixture clock is
 // controlled separately by timeline timestamps and is never used as latency.
@@ -77,6 +77,7 @@ func RunV2(ctx context.Context, dataset DatasetV2, config ConfigV2) (ManifestV2,
 			MeasuredRuns:            config.MeasuredRuns,
 			QueryTimeoutNanoseconds: config.QueryTimeout.Nanoseconds(),
 			ConfigHash:              configHashV2(config),
+			QualityUncertainty:      qualityUncertaintyMetadataV2(),
 		},
 	}
 
@@ -613,10 +614,12 @@ func (state *caseRuntimeV2) policyV2(scope ScopeV2, asOf time.Time, searches [][
 func summarizeArmV2(queries []QueryResultV2) (ArmAggregateV2, error) {
 	aggregate := ArmAggregateV2{QueryCount: len(queries), PolicyPassed: true}
 	var durations []time.Duration
+	var qualitySamples []QueryQualityV2
 	policyPasses := 0
 	nonRecallPasses := 0
 	for _, query := range queries {
 		if query.Quality != nil {
+			qualitySamples = append(qualitySamples, *query.Quality)
 			aggregate.QualityQueryCount++
 			aggregate.RecallAtK += query.Quality.RecallAtK
 			aggregate.MRR += query.Quality.MRR
@@ -663,6 +666,11 @@ func summarizeArmV2(queries []QueryResultV2) (ArmAggregateV2, error) {
 		aggregate.MRR /= count
 		aggregate.NDCGAtK /= count
 		aggregate.PassRate /= count
+		intervals, err := qualityIntervalsV2(qualitySamples)
+		if err != nil {
+			return ArmAggregateV2{}, err
+		}
+		aggregate.QualityIntervals = &intervals
 	}
 	if aggregate.QueryCount > 0 {
 		aggregate.PolicyPassRate = float64(policyPasses) / float64(aggregate.QueryCount)
@@ -873,16 +881,28 @@ func configHashV2(config ConfigV2) string {
 		descriptors = append(descriptors, factory.Descriptor())
 	}
 	value := struct {
-		Runner             string          `json:"runner"`
-		RecallK            int             `json:"recall_k"`
-		NDCGK              int             `json:"ndcg_k"`
-		WarmupRuns         int             `json:"warmup_runs"`
-		MeasuredRuns       int             `json:"measured_runs"`
-		QueryTimeout       int64           `json:"query_timeout_nanoseconds"`
-		CleanRequired      bool            `json:"clean_required"`
-		PolicyPassRequired bool            `json:"policy_pass_required"`
-		Arms               []ArmDescriptor `json:"arms"`
-	}{runnerVersionV2, config.RecallK, config.NDCGK, config.WarmupRuns, config.MeasuredRuns, config.QueryTimeout.Nanoseconds(), config.Source.CleanRequired, config.RequirePolicyPass, descriptors}
+		Runner             string                       `json:"runner"`
+		RecallK            int                          `json:"recall_k"`
+		NDCGK              int                          `json:"ndcg_k"`
+		WarmupRuns         int                          `json:"warmup_runs"`
+		MeasuredRuns       int                          `json:"measured_runs"`
+		QueryTimeout       int64                        `json:"query_timeout_nanoseconds"`
+		CleanRequired      bool                         `json:"clean_required"`
+		PolicyPassRequired bool                         `json:"policy_pass_required"`
+		Arms               []ArmDescriptor              `json:"arms"`
+		QualityUncertainty QualityUncertaintyMetadataV2 `json:"quality_uncertainty"`
+	}{
+		Runner:             runnerVersionV2,
+		RecallK:            config.RecallK,
+		NDCGK:              config.NDCGK,
+		WarmupRuns:         config.WarmupRuns,
+		MeasuredRuns:       config.MeasuredRuns,
+		QueryTimeout:       config.QueryTimeout.Nanoseconds(),
+		CleanRequired:      config.Source.CleanRequired,
+		PolicyPassRequired: config.RequirePolicyPass,
+		Arms:               descriptors,
+		QualityUncertainty: qualityUncertaintyMetadataV2(),
+	}
 	encoded, _ := json.Marshal(value)
 	digest := sha256.Sum256(encoded)
 	return hex.EncodeToString(digest[:])
