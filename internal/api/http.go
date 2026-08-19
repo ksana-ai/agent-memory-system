@@ -17,19 +17,77 @@ import (
 const maxRequestBytes = 64 << 10
 
 type Handler struct {
-	service *app.Service
+	service   *app.Service
+	phase     string
+	storage   string
+	readiness ReadinessChecker
 }
 
-func NewHandler(service *app.Service) (*Handler, error) {
+// ReadinessChecker is the smallest database capability required by /readyz.
+// Keeping it separate from the application's Store interface avoids coupling
+// domain operations to process lifecycle concerns.
+type ReadinessChecker interface {
+	Ping(context.Context) error
+}
+
+type HandlerOption func(*Handler) error
+
+func WithPhase(phase string) HandlerOption {
+	return func(handler *Handler) error {
+		phase = strings.TrimSpace(phase)
+		if phase == "" {
+			return errors.New("health phase is required")
+		}
+		handler.phase = phase
+		return nil
+	}
+}
+
+func WithStorage(storage string) HandlerOption {
+	return func(handler *Handler) error {
+		storage = strings.TrimSpace(storage)
+		if storage == "" {
+			return errors.New("health storage is required")
+		}
+		handler.storage = storage
+		return nil
+	}
+}
+
+func WithReadiness(readiness ReadinessChecker) HandlerOption {
+	return func(handler *Handler) error {
+		if readiness == nil {
+			return errors.New("readiness checker is required")
+		}
+		handler.readiness = readiness
+		return nil
+	}
+}
+
+func NewHandler(service *app.Service, options ...HandlerOption) (*Handler, error) {
 	if service == nil {
 		return nil, errors.New("service is required")
 	}
-	return &Handler{service: service}, nil
+	handler := &Handler{
+		service: service,
+		phase:   "walking-skeleton",
+		storage: "test-double",
+	}
+	for _, option := range options {
+		if option == nil {
+			return nil, errors.New("handler option is required")
+		}
+		if err := option(handler); err != nil {
+			return nil, fmt.Errorf("configure HTTP handler: %w", err)
+		}
+	}
+	return handler, nil
 }
 
 func (handler *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handler.health)
+	mux.HandleFunc("GET /readyz", handler.ready)
 	mux.HandleFunc("POST /v1/evidence", handler.ingestEvidence)
 	mux.HandleFunc("POST /v1/memory-candidates", handler.proposeCandidate)
 	mux.HandleFunc("POST /v1/memory-candidates/{candidate_id}/reviews", handler.reviewCandidate)
@@ -41,8 +99,26 @@ func (handler *Handler) Routes() http.Handler {
 func (handler *Handler) health(writer http.ResponseWriter, _ *http.Request) {
 	writeJSON(writer, http.StatusOK, map[string]string{
 		"status":  "ok",
-		"phase":   "walking-skeleton",
-		"storage": "in-memory",
+		"phase":   handler.phase,
+		"storage": handler.storage,
+	})
+}
+
+func (handler *Handler) ready(writer http.ResponseWriter, request *http.Request) {
+	if handler.readiness != nil {
+		ctx, cancel := context.WithTimeout(request.Context(), 2*time.Second)
+		defer cancel()
+		if err := handler.readiness.Ping(ctx); err != nil {
+			writeJSON(writer, http.StatusServiceUnavailable, map[string]string{
+				"status":  "not_ready",
+				"storage": handler.storage,
+			})
+			return
+		}
+	}
+	writeJSON(writer, http.StatusOK, map[string]string{
+		"status":  "ready",
+		"storage": handler.storage,
 	})
 }
 

@@ -2,7 +2,9 @@ package api_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -122,7 +124,81 @@ func TestHTTPRejectsExplicitZeroContextLimit(t *testing.T) {
 	}
 }
 
+func TestHealthIsLiveWithoutProbingStorage(t *testing.T) {
+	readiness := &readinessStub{err: errors.New("database unavailable")}
+	routes := newRoutesWithOptions(
+		t,
+		api.WithPhase("durable-storage"),
+		api.WithStorage("postgresql"),
+		api.WithReadiness(readiness),
+	)
+
+	response := perform(t, routes, http.MethodGet, "/healthz", "", false)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if readiness.calls != 0 {
+		t.Fatalf("liveness called storage Ping %d times", readiness.calls)
+	}
+	var body map[string]string
+	decodeResponse(t, response, &body)
+	if body["status"] != "ok" || body["phase"] != "durable-storage" || body["storage"] != "postgresql" {
+		t.Fatalf("unexpected health response: %#v", body)
+	}
+}
+
+func TestReadyProbesStorage(t *testing.T) {
+	readiness := &readinessStub{}
+	routes := newRoutesWithOptions(
+		t,
+		api.WithStorage("postgresql"),
+		api.WithReadiness(readiness),
+	)
+
+	response := perform(t, routes, http.MethodGet, "/readyz", "", false)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if readiness.calls != 1 {
+		t.Fatalf("readiness called storage Ping %d times", readiness.calls)
+	}
+	var body map[string]string
+	decodeResponse(t, response, &body)
+	if body["status"] != "ready" || body["storage"] != "postgresql" {
+		t.Fatalf("unexpected readiness response: %#v", body)
+	}
+}
+
+func TestReadyReturnsServiceUnavailableWithoutLeakingPingError(t *testing.T) {
+	readiness := &readinessStub{err: errors.New("secret database details")}
+	routes := newRoutesWithOptions(
+		t,
+		api.WithStorage("postgresql"),
+		api.WithReadiness(readiness),
+	)
+
+	response := perform(t, routes, http.MethodGet, "/readyz", "", false)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if readiness.calls != 1 {
+		t.Fatalf("readiness called storage Ping %d times", readiness.calls)
+	}
+	var body map[string]string
+	decodeResponse(t, response, &body)
+	if body["status"] != "not_ready" || body["storage"] != "postgresql" {
+		t.Fatalf("unexpected readiness response: %#v", body)
+	}
+	if _, exists := body["error"]; exists {
+		t.Fatalf("readiness leaked implementation error: %#v", body)
+	}
+}
+
 func newRoutes(t *testing.T) http.Handler {
+	return newRoutesWithOptions(t)
+}
+
+func newRoutesWithOptions(t *testing.T, options ...api.HandlerOption) http.Handler {
 	t.Helper()
 	storage := memstore.New()
 	retriever, err := retrieval.NewBM25(storage)
@@ -133,11 +209,21 @@ func newRoutes(t *testing.T) http.Handler {
 	if err != nil {
 		t.Fatalf("new service: %v", err)
 	}
-	handler, err := api.NewHandler(service)
+	handler, err := api.NewHandler(service, options...)
 	if err != nil {
 		t.Fatalf("new handler: %v", err)
 	}
 	return handler.Routes()
+}
+
+type readinessStub struct {
+	err   error
+	calls int
+}
+
+func (stub *readinessStub) Ping(context.Context) error {
+	stub.calls++
+	return stub.err
 }
 
 func perform(t *testing.T, handler http.Handler, method, path, body string, includeUser bool) *httptest.ResponseRecorder {
