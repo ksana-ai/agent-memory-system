@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kai443/go-agent-memory-system/internal/app"
 	"github.com/kai443/go-agent-memory-system/internal/domain"
 	"github.com/kai443/go-agent-memory-system/internal/retrieval"
 	"github.com/kai443/go-agent-memory-system/internal/store"
@@ -94,6 +95,130 @@ func TestRunV2ExecutesLifecycleForEveryArmAndSeparatesQualityFromPolicy(t *testi
 	}
 	if bm25.Aggregate.QualityResultSHA256 != secondBM25.Aggregate.QualityResultSHA256 {
 		t.Fatal("quality result hash changed with latency")
+	}
+}
+
+func TestRunV2UsesQueryTimestampAsOfAndFiltersExpirationBoundary(t *testing.T) {
+	dataset := mustLoadDatasetV2(t, `{
+  "schema_version":"2","id":"expiration-as-of","version":"1","description":"query time controls expiration",
+  "cases":[{"id":"expiration-case","scopes":[{"id":"s","tenant_id":"t","user_id":"u"}],"timeline":[
+    {"op":"memory.remember","memory_ref":"expired","scope":"s","at":"2026-01-01T00:01:00Z","review_state":"approved","memory":{"kind":"semantic","category":"deployment","key":"old_region","value":"Aurora deploy region Singapore","expires_at":"2026-01-01T00:04:00Z"},"evidence":[{"alias":"expired-source","session_id":"history","actor":"user","content":"Aurora deploy region Singapore","occurred_at":"2026-01-01T00:00:00Z"}]},
+    {"op":"memory.remember","memory_ref":"current","scope":"s","at":"2026-01-01T00:03:00Z","review_state":"approved","memory":{"kind":"semantic","category":"deployment","key":"current_region","value":"Aurora deploy region Tokyo"},"evidence":[{"alias":"current-source","session_id":"current","actor":"user","content":"Aurora deploy region Tokyo","occurred_at":"2026-01-01T00:02:00Z"}]},
+    {"op":"query","id":"q","scope":"s","at":"2026-01-01T00:04:00Z","text":"Aurora deploy region Tokyo","judgments":{"memory_cards":{"relevance":{"current":3},"forbidden":["expired"]}}}
+  ]}]
+}`)
+	var observedAsOf []time.Time
+	factory := armFactory{
+		descriptor: ArmDescriptor{ID: "expiration-as-of-v1", Version: "1", JudgmentProfile: "reviewed-memory-alias-v1", ResultKind: "memory-card", ConfigHash: hashArmConfig("expiration-as-of")},
+		newRuntime: func(context.Context) (ArmRuntime, error) {
+			storage := memstore.New()
+			retriever, err := retrieval.NewBM25(storage)
+			return ArmRuntime{Store: storage, Retriever: &asOfRecordingRetrieverV2{inner: retriever, observed: &observedAsOf}}, err
+		},
+	}
+	manifest, err := RunV2(context.Background(), dataset, ConfigV2{
+		RecallK: 2, NDCGK: 2, WarmupRuns: 1, MeasuredRuns: 2, QueryTimeout: time.Second,
+		Arms: []ArmFactory{factory}, Timer: &stepTimerV2{step: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("RunV2(): %v", err)
+	}
+	query := manifest.Arms[0].Queries[0]
+	if len(query.Hits) != 1 || query.Hits[0].Alias != "current" {
+		t.Fatalf("expiration-boundary hits = %#v", query.Hits)
+	}
+	if !query.Policy.Passed || query.Policy.ExpiredHits != 0 || query.Policy.ForbiddenHits != 0 {
+		t.Fatalf("expiration-boundary policy = %#v", query.Policy)
+	}
+	wantAsOf := time.Date(2026, 1, 1, 0, 4, 0, 0, time.UTC)
+	if len(observedAsOf) != 3 {
+		t.Fatalf("as-of observations = %v, want three", observedAsOf)
+	}
+	for index, asOf := range observedAsOf {
+		if !asOf.Equal(wantAsOf) {
+			t.Fatalf("as-of observation[%d] = %s, want %s", index, asOf, wantAsOf)
+		}
+	}
+}
+
+func TestRunV2CountsExpiredHitsFromUntrustedRetriever(t *testing.T) {
+	dataset := mustLoadDatasetV2(t, `{
+  "schema_version":"2","id":"expiration-policy","version":"1","description":"expired hit policy",
+  "cases":[{"id":"expiration-policy-case","scopes":[{"id":"s","tenant_id":"t","user_id":"u"}],"timeline":[
+    {"op":"memory.remember","memory_ref":"expired","scope":"s","at":"2026-01-01T00:01:00Z","review_state":"approved","memory":{"kind":"semantic","category":"marker","key":"temporary","value":"EXPIRY-9033","expires_at":"2026-01-01T00:02:00Z"},"evidence":[{"alias":"source","session_id":"session","actor":"user","content":"temporary EXPIRY-9033","occurred_at":"2026-01-01T00:00:00Z"}]},
+    {"op":"query","id":"q","scope":"s","at":"2026-01-01T00:02:00Z","text":"EXPIRY-9033","judgments":{"memory_cards":{"forbidden":["expired"],"require_empty":true}}}
+  ]}]
+}`)
+	expiresAt := time.Date(2026, 1, 1, 0, 2, 0, 0, time.UTC)
+	card := domain.MemoryCard{
+		ID:          stableArtifactIDV2("mem", "expiration-policy-case", "expired"),
+		CandidateID: stableArtifactIDV2("cand", "expiration-policy-case", "\x00compact-candidate:expired"),
+		TenantID:    "t", UserID: "u", Kind: domain.MemoryKindSemantic, Category: "marker", Key: "temporary", Value: "EXPIRY-9033",
+		SourceEventIDs: []string{stableArtifactIDV2("evt", "expiration-policy-case", "source")}, Version: 1,
+		Status: domain.MemoryActive, CreatedAt: time.Date(2026, 1, 1, 0, 1, 0, 0, time.UTC), ExpiresAt: &expiresAt,
+	}
+	factory := armFactory{
+		descriptor: ArmDescriptor{ID: "expired-hit-v1", Version: "1", JudgmentProfile: "reviewed-memory-alias-v1", ResultKind: "memory-card", ConfigHash: hashArmConfig("expired-hit")},
+		newRuntime: func(context.Context) (ArmRuntime, error) {
+			return ArmRuntime{Store: memstore.New(), Retriever: staticRetrieverV2{hits: []domain.SearchHit{{Memory: card, Score: 1}}}}, nil
+		},
+	}
+	manifest, err := RunV2(context.Background(), dataset, ConfigV2{
+		RecallK: 1, NDCGK: 1, MeasuredRuns: 1, QueryTimeout: time.Second,
+		Arms: []ArmFactory{factory}, Timer: &stepTimerV2{step: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("RunV2(): %v", err)
+	}
+	query := manifest.Arms[0].Queries[0]
+	if query.Policy.ExpiredHits != 1 || query.Policy.ForbiddenHits != 1 || !query.Policy.RequireEmptyFailure || query.Policy.Passed {
+		t.Fatalf("expired-hit policy = %#v", query.Policy)
+	}
+	if query.ExecutionError == "" || !strings.Contains(query.ExecutionError, "non-serviceable") {
+		t.Fatalf("expired-hit execution error = %q", query.ExecutionError)
+	}
+	if manifest.Arms[0].Aggregate.ExpiredHits != 1 || manifest.Arms[0].Aggregate.PolicyPassed {
+		t.Fatalf("expired-hit aggregate = %#v", manifest.Arms[0].Aggregate)
+	}
+}
+
+func TestRunV2ExpirationParticipatesInPayloadOracleAndHash(t *testing.T) {
+	dataset := mustLoadDatasetV2(t, `{
+  "schema_version":"2","id":"expiration-payload","version":"1","description":"expiration payload oracle",
+  "cases":[{"id":"expiration-payload-case","scopes":[{"id":"s","tenant_id":"t","user_id":"u"}],"timeline":[
+    {"op":"memory.remember","memory_ref":"memory","scope":"s","at":"2026-01-01T00:01:00Z","review_state":"approved","memory":{"kind":"semantic","category":"marker","key":"temporary","value":"trusted","expires_at":"2026-01-01T00:10:00Z"},"evidence":[{"alias":"source","session_id":"session","actor":"user","content":"trusted temporary value","occurred_at":"2026-01-01T00:00:00Z"}]},
+    {"op":"query","id":"q","scope":"s","at":"2026-01-01T00:02:00Z","text":"trusted temporary","judgments":{"memory_cards":{"relevance":{"memory":3}}}}
+  ]}]
+}`)
+	expiresAt := time.Date(2026, 1, 1, 0, 10, 0, 0, time.UTC)
+	expected := domain.MemoryCard{
+		ID:          stableArtifactIDV2("mem", "expiration-payload-case", "memory"),
+		CandidateID: stableArtifactIDV2("cand", "expiration-payload-case", "\x00compact-candidate:memory"),
+		TenantID:    "t", UserID: "u", Kind: domain.MemoryKindSemantic, Category: "marker", Key: "temporary", Value: "trusted",
+		SourceEventIDs: []string{stableArtifactIDV2("evt", "expiration-payload-case", "source")}, Version: 1,
+		Status: domain.MemoryActive, CreatedAt: time.Date(2026, 1, 1, 0, 1, 0, 0, time.UTC), ExpiresAt: &expiresAt,
+	}
+	tampered := expected
+	tampered.ExpiresAt = nil
+	factory := armFactory{
+		descriptor: ArmDescriptor{ID: "expiration-payload-v1", Version: "1", JudgmentProfile: "reviewed-memory-alias-v1", ResultKind: "memory-card", ConfigHash: hashArmConfig("expiration-payload")},
+		newRuntime: func(context.Context) (ArmRuntime, error) {
+			return ArmRuntime{Store: memstore.New(), Retriever: staticRetrieverV2{hits: []domain.SearchHit{{Memory: tampered, Score: 1}}}}, nil
+		},
+	}
+	manifest, err := RunV2(context.Background(), dataset, ConfigV2{
+		RecallK: 1, NDCGK: 1, MeasuredRuns: 1, QueryTimeout: time.Second,
+		Arms: []ArmFactory{factory}, Timer: &stepTimerV2{step: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("RunV2(): %v", err)
+	}
+	query := manifest.Arms[0].Queries[0]
+	if query.Policy.MemoryPayloadViolations == 0 || query.Policy.Passed {
+		t.Fatalf("expiration payload substitution passed policy: %#v", query.Policy)
+	}
+	if len(query.Hits) != 1 || query.Hits[0].PayloadSHA256 == memoryPayloadHashV2(expected) {
+		t.Fatalf("expiration was omitted from the full payload hash: %#v", query.Hits)
 	}
 }
 
@@ -386,11 +511,11 @@ func TestRunV2RejectsEvidencePayloadSubstitution(t *testing.T) {
 	}
 }
 
-func TestRunV2DoesNotLetStoreReturnValueDefineExpectedMemory(t *testing.T) {
+func TestRunV2DoesNotLetStoreReturnValueDefineExpectedExpiration(t *testing.T) {
 	dataset := mustLoadDatasetV2(t, `{
   "schema_version":"2","id":"review-oracle","version":"1","description":"review return corruption",
   "cases":[{"id":"review-case","scopes":[{"id":"s","tenant_id":"t","user_id":"u"}],"timeline":[
-    {"op":"memory.remember","memory_ref":"memory","scope":"s","at":"2026-01-01T00:01:00Z","review_state":"approved","memory":{"kind":"semantic","category":"c","key":"k","value":"trusted"},"evidence":[{"alias":"source","session_id":"session","actor":"user","content":"trusted","occurred_at":"2026-01-01T00:00:00Z"}]},
+    {"op":"memory.remember","memory_ref":"memory","scope":"s","at":"2026-01-01T00:01:00Z","review_state":"approved","memory":{"kind":"semantic","category":"c","key":"k","value":"trusted","expires_at":"2026-01-01T00:10:00Z"},"evidence":[{"alias":"source","session_id":"session","actor":"user","content":"trusted","occurred_at":"2026-01-01T00:00:00Z"}]},
     {"op":"query","id":"q","scope":"s","at":"2026-01-01T00:02:00Z","text":"trusted","judgments":{"memory_cards":{"relevance":{"memory":3}}}}
   ]}]
 }`)
@@ -425,7 +550,7 @@ func (timer *stepTimerV2) Now() time.Time {
 
 type staticRetrieverV2 struct{ hits []domain.SearchHit }
 
-func (retriever staticRetrieverV2) Search(context.Context, string, string, string, int) ([]domain.SearchHit, error) {
+func (retriever staticRetrieverV2) Search(context.Context, string, string, string, int, time.Time) ([]domain.SearchHit, error) {
 	return append([]domain.SearchHit(nil), retriever.hits...), nil
 }
 
@@ -434,13 +559,23 @@ type sequenceRetrieverV2 struct {
 	next    int
 }
 
-func (retriever *sequenceRetrieverV2) Search(context.Context, string, string, string, int) ([]domain.SearchHit, error) {
+func (retriever *sequenceRetrieverV2) Search(context.Context, string, string, string, int, time.Time) ([]domain.SearchHit, error) {
 	index := retriever.next
 	if index >= len(retriever.results) {
 		index = len(retriever.results) - 1
 	}
 	retriever.next++
 	return append([]domain.SearchHit(nil), retriever.results[index]...), nil
+}
+
+type asOfRecordingRetrieverV2 struct {
+	inner    app.Retriever
+	observed *[]time.Time
+}
+
+func (retriever *asOfRecordingRetrieverV2) Search(ctx context.Context, tenantID, userID, query string, limit int, asOf time.Time) ([]domain.SearchHit, error) {
+	*retriever.observed = append(*retriever.observed, asOf)
+	return retriever.inner.Search(ctx, tenantID, userID, query, limit, asOf)
 }
 
 type reorderingStoreV2 struct{ store.Store }
@@ -471,7 +606,7 @@ type corruptReviewStoreV2 struct{ store.Store }
 func (storage corruptReviewStoreV2) ReviewCandidate(ctx context.Context, command store.CandidateReviewCommand) (domain.MemoryCandidate, *domain.MemoryCard, error) {
 	candidate, card, err := storage.Store.ReviewCandidate(ctx, command)
 	if err == nil && card != nil {
-		card.Value = "substituted memory"
+		card.ExpiresAt = nil
 	}
 	return candidate, card, err
 }

@@ -76,6 +76,7 @@ type MemoryCandidate struct {
 	Status           CandidateStatus   `json:"status"`
 	Review           *CandidateReview  `json:"review,omitempty"`
 	CreatedAt        time.Time         `json:"created_at"`
+	ExpiresAt        *time.Time        `json:"expires_at,omitempty"`
 	Metadata         map[string]string `json:"metadata,omitempty"`
 }
 
@@ -86,8 +87,9 @@ type CandidateReview struct {
 	ReviewedAt time.Time      `json:"reviewed_at"`
 }
 
-// MemoryCard is a reviewed, serviceable projection. Cards sharing the same
-// identity form an ordered version chain; at most one version is active.
+// MemoryCard is a reviewed projection. Cards sharing the same identity form
+// an ordered version chain; at most one version is active. Active cards may
+// still be unavailable after ExpiresAt; callers use ServiceableAt.
 type MemoryCard struct {
 	ID             string       `json:"id"`
 	CandidateID    string       `json:"candidate_id"`
@@ -104,7 +106,14 @@ type MemoryCard struct {
 	Version        int          `json:"version"`
 	Status         MemoryStatus `json:"status"`
 	CreatedAt      time.Time    `json:"created_at"`
+	ExpiresAt      *time.Time   `json:"expires_at,omitempty"`
 	SupersededAt   *time.Time   `json:"superseded_at,omitempty"`
+}
+
+// ServiceableAt applies the request-time availability boundary without
+// changing lifecycle status. expires_at is exclusive: equality is expired.
+func (m MemoryCard) ServiceableAt(asOf time.Time) bool {
+	return m.Status == MemoryActive && (m.ExpiresAt == nil || m.ExpiresAt.After(asOf))
 }
 
 type MemoryIdentity struct {

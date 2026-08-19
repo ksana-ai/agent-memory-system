@@ -3,6 +3,7 @@ package eval
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 const validDatasetV2 = `{
@@ -290,6 +291,72 @@ func TestLoadV2RejectsPendingRememberAsPositiveGold(t *testing.T) {
 	_, err := LoadV2([]byte(data))
 	if err == nil || !strings.Contains(err.Error(), "not an active memory") {
 		t.Fatalf("LoadV2() error = %v, want inactive-memory error", err)
+	}
+}
+
+func TestLoadV2DetailedLifecycleAppliesExpirationAtQueryBoundary(t *testing.T) {
+	beforeExpiry := strings.Replace(
+		validDetailedDatasetV2,
+		`"value":"tea"`,
+		`"value":"tea","expires_at":"2026-08-01T10:04:00Z"`,
+		1,
+	)
+	dataset, err := LoadV2([]byte(beforeExpiry))
+	if err != nil {
+		t.Fatalf("LoadV2() before expiry: %v", err)
+	}
+	memory := dataset.Cases[0].Timeline[1].(*CandidateProposeV2).Memory
+	if memory.ExpiresAt == nil || !memory.ExpiresAt.Equal(time.Date(2026, 8, 1, 10, 4, 0, 0, time.UTC)) {
+		t.Fatalf("expires_at = %v", memory.ExpiresAt)
+	}
+
+	atBoundary := strings.Replace(beforeExpiry, `"expires_at":"2026-08-01T10:04:00Z"`, `"expires_at":"2026-08-01T10:03:00Z"`, 1)
+	if _, err := LoadV2([]byte(atBoundary)); err == nil || !strings.Contains(err.Error(), "expired at") {
+		t.Fatalf("LoadV2() boundary error = %v, want expired positive-qrel error", err)
+	}
+
+	afterExpiry := strings.Replace(beforeExpiry, `"expires_at":"2026-08-01T10:04:00Z"`, `"expires_at":"2026-08-01T10:02:59Z"`, 1)
+	if _, err := LoadV2([]byte(afterExpiry)); err == nil || !strings.Contains(err.Error(), "expired at") {
+		t.Fatalf("LoadV2() after-expiry error = %v, want expired positive-qrel error", err)
+	}
+
+	forbiddenAtBoundary := strings.Replace(
+		atBoundary,
+		`"memory_cards":{"relevance":{"mem_detail":3}}`,
+		`"memory_cards":{"forbidden":["mem_detail"],"require_empty":true}`,
+		1,
+	)
+	if _, err := LoadV2([]byte(forbiddenAtBoundary)); err != nil {
+		t.Fatalf("LoadV2() expired forbidden qrel: %v", err)
+	}
+}
+
+func TestLoadV2RejectsZeroExpirationAndDetectsExpirationMutation(t *testing.T) {
+	zeroExpiry := strings.Replace(
+		validDetailedDatasetV2,
+		`"value":"tea"`,
+		`"value":"tea","expires_at":"0001-01-01T00:00:00Z"`,
+		1,
+	)
+	if _, err := LoadV2([]byte(zeroExpiry)); err == nil || !strings.Contains(err.Error(), "expires_at must not be zero") {
+		t.Fatalf("LoadV2() zero expiry error = %v", err)
+	}
+
+	withExpiry := strings.Replace(
+		validDetailedDatasetV2,
+		`"value":"tea"`,
+		`"value":"tea","expires_at":"2026-08-01T10:04:00Z"`,
+		1,
+	)
+	dataset, err := LoadV2([]byte(withExpiry))
+	if err != nil {
+		t.Fatalf("LoadV2(): %v", err)
+	}
+	memory := &dataset.Cases[0].Timeline[1].(*CandidateProposeV2).Memory
+	mutated := memory.ExpiresAt.Add(time.Minute)
+	memory.ExpiresAt = &mutated
+	if err := dataset.VerifyIntegrity(); err == nil || !strings.Contains(err.Error(), "changed after loading") {
+		t.Fatalf("VerifyIntegrity() expiration error = %v", err)
 	}
 }
 

@@ -27,7 +27,7 @@ type Store interface {
 	CandidateByID(context.Context, string, string, string) (domain.MemoryCandidate, error)
 	ReviewCandidate(context.Context, CandidateReviewCommand) (domain.MemoryCandidate, *domain.MemoryCard, error)
 
-	ListActiveMemories(context.Context, string, string) ([]domain.MemoryCard, error)
+	ListServiceableMemories(context.Context, string, string, time.Time) ([]domain.MemoryCard, error)
 	ContextRevision(context.Context, string, string) (uint64, error)
 	ForgetUser(context.Context, string, string, time.Time) (domain.DeletionReceipt, error)
 }

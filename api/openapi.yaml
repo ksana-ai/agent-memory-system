@@ -224,6 +224,7 @@ components:
           items: {type: string}
         extractor: {type: string, x-max-bytes: 128}
         extractor_version: {type: string, x-max-bytes: 128}
+        expires_at: {type: string, format: date-time}
         metadata:
           type: object
           additionalProperties: {type: string, x-max-bytes: 1024}
@@ -288,6 +289,7 @@ components:
         status: {type: string, enum: [pending, approved, rejected]}
         review: {$ref: "#/components/schemas/CandidateReview"}
         created_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
         metadata:
           type: object
           additionalProperties: {type: string}
@@ -312,6 +314,7 @@ components:
         version: {type: integer, minimum: 1}
         status: {type: string, enum: [active, superseded]}
         created_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
         superseded_at: {type: string, format: date-time}
     ReviewCandidateResponse:
       type: object

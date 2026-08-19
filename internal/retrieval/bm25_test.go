@@ -11,8 +11,14 @@ import (
 
 type staticMemorySource []domain.MemoryCard
 
-func (source staticMemorySource) ListActiveMemories(context.Context, string, string) ([]domain.MemoryCard, error) {
-	return append([]domain.MemoryCard(nil), source...), nil
+func (source staticMemorySource) ListServiceableMemories(_ context.Context, _, _ string, asOf time.Time) ([]domain.MemoryCard, error) {
+	result := make([]domain.MemoryCard, 0, len(source))
+	for _, memory := range source {
+		if memory.ServiceableAt(asOf) {
+			result = append(result, memory)
+		}
+	}
+	return result, nil
 }
 
 func TestBM25RanksMatchingCardFirst(t *testing.T) {
@@ -24,7 +30,7 @@ func TestBM25RanksMatchingCardFirst(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new BM25: %v", err)
 	}
-	hits, err := retriever.Search(context.Background(), "tenant", "user", "preferred vegetarian meal", 2)
+	hits, err := retriever.Search(context.Background(), "tenant", "user", "preferred vegetarian meal", 2, now)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -62,7 +68,7 @@ func TestBM25SearchIsDeterministicAcrossRuns(t *testing.T) {
 	var baselineIDs []string
 	var baselineScores []float64
 	for run := 0; run < 100; run++ {
-		hits, err := retriever.Search(context.Background(), "tenant", "user", "alpha beta", 3)
+		hits, err := retriever.Search(context.Background(), "tenant", "user", "alpha beta", 3, now)
 		if err != nil {
 			t.Fatalf("search run %d: %v", run, err)
 		}
@@ -80,5 +86,26 @@ func TestBM25SearchIsDeterministicAcrossRuns(t *testing.T) {
 		if !slices.Equal(ids, baselineIDs) || !slices.Equal(scores, baselineScores) {
 			t.Fatalf("run %d changed ranking: ids=%v scores=%v, want ids=%v scores=%v", run, ids, scores, baselineIDs, baselineScores)
 		}
+	}
+}
+
+func TestBM25PassesAsOfAndExcludesExpiredCardsAtBoundary(t *testing.T) {
+	asOf := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	past := asOf.Add(-time.Nanosecond)
+	future := asOf.Add(time.Nanosecond)
+	retriever, err := NewBM25(staticMemorySource{
+		{ID: "past", Key: "marker", Value: "expired", Status: domain.MemoryActive, ExpiresAt: &past},
+		{ID: "equal", Key: "marker", Value: "boundary", Status: domain.MemoryActive, ExpiresAt: &asOf},
+		{ID: "future", Key: "marker", Value: "serviceable", Status: domain.MemoryActive, ExpiresAt: &future},
+	})
+	if err != nil {
+		t.Fatalf("new BM25: %v", err)
+	}
+	hits, err := retriever.Search(context.Background(), "tenant", "user", "marker", 5, asOf)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) != 1 || hits[0].Memory.ID != "future" {
+		t.Fatalf("expiration boundary hits = %#v, want only future", hits)
 	}
 }

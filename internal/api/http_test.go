@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/kai443/go-agent-memory-system/internal/api"
 	"github.com/kai443/go-agent-memory-system/internal/app"
@@ -39,13 +40,17 @@ func TestHTTPLifecycle(t *testing.T) {
 		"backstory":"Direct statement from the user.",
 		"source_event_ids":["evt_http_1"],
 		"extractor":"manual-test",
-		"extractor_version":"v1"
+		"extractor_version":"v1",
+		"expires_at":"2099-01-02T03:04:05Z"
 	}`, true)
 	if candidateResponse.Code != http.StatusCreated {
 		t.Fatalf("candidate status=%d body=%s", candidateResponse.Code, candidateResponse.Body.String())
 	}
 	var candidate domain.MemoryCandidate
 	decodeResponse(t, candidateResponse, &candidate)
+	if candidate.ExpiresAt == nil || candidate.ExpiresAt.Format(time.RFC3339) != "2099-01-02T03:04:05Z" {
+		t.Fatalf("candidate expiration did not round-trip: %#v", candidate.ExpiresAt)
+	}
 
 	reviewResponse := perform(t, routes, http.MethodPost, "/v1/memory-candidates/"+candidate.ID+"/reviews", `{
 		"decision":"approve",
@@ -54,6 +59,14 @@ func TestHTTPLifecycle(t *testing.T) {
 	}`, true)
 	if reviewResponse.Code != http.StatusOK {
 		t.Fatalf("review status=%d body=%s", reviewResponse.Code, reviewResponse.Body.String())
+	}
+	var reviewed struct {
+		Candidate domain.MemoryCandidate `json:"candidate"`
+		Memory    *domain.MemoryCard     `json:"memory"`
+	}
+	decodeResponse(t, reviewResponse, &reviewed)
+	if reviewed.Memory == nil || reviewed.Memory.ExpiresAt == nil || !reviewed.Memory.ExpiresAt.Equal(*candidate.ExpiresAt) {
+		t.Fatalf("review expiration did not round-trip: %#v", reviewed)
 	}
 
 	contextResponse := perform(t, routes, http.MethodPost, "/v1/context-packs", `{

@@ -1,8 +1,8 @@
 {
   "schema_version": "2",
   "id": "memory-lifecycle-hard-v2",
-  "version": "2.0.0",
-  "description": "A deterministic 28-case reviewed-memory lifecycle and lexical retrieval benchmark. It covers direct recall, multi-session entities, version updates, Chinese and mixed-language retrieval, erasure, rejected and pending candidates, and adversarial tenant/user isolation through real application lifecycle operations. True time-based expiration is intentionally omitted because the current domain has no expires_at or as-of serviceability contract; no fixture-side filtering is used to simulate that missing capability. Opaque aliases are judgments only and never appear in searchable memory fields.",
+  "version": "2.1.0",
+  "description": "A deterministic 30-case reviewed-memory lifecycle and lexical retrieval benchmark. It covers direct recall, multi-session entities, version updates, Chinese and mixed-language retrieval, erasure, rejected and pending candidates, request-time expiration including the exact expires_at boundary, and adversarial tenant/user isolation through real application lifecycle operations. Opaque aliases are judgments only and never appear in searchable memory fields.",
   "cases": [
     {
       "id": "a01",
@@ -3292,13 +3292,12 @@
     },
     {
       "id": "e01",
-      "description": "A whole-user erasure must remove an exact lexical beacon; true time expiration is intentionally outside this 28-case tranche.",
+      "description": "A whole-user erasure must remove an exact lexical beacon.",
       "tags": [
         "lifecycle_non_recall",
         "lang_en",
         "current_domain",
-        "delete",
-        "expiration_gap_not_covered"
+        "delete"
       ],
       "scopes": [
         {
@@ -3413,8 +3412,7 @@
         "lang_zh",
         "current_domain",
         "rejected",
-        "pending",
-        "expiration_gap_not_covered"
+        "pending"
       ],
       "scopes": [
         {
@@ -3535,6 +3533,155 @@
               "forbidden": [
                 "m_e02_01",
                 "m_e02_02"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "e03",
+      "description": "A reviewed memory expires exactly at the query timestamp and must not be recalled at that exclusive boundary.",
+      "tags": [
+        "lifecycle_non_recall",
+        "lang_en",
+        "current_domain",
+        "expiration",
+        "expiration_boundary"
+      ],
+      "scopes": [
+        {
+          "id": "subject",
+          "tenant_id": "tenant-e03",
+          "user_id": "user-e03"
+        }
+      ],
+      "timeline": [
+        {
+          "op": "memory.remember",
+          "memory_ref": "m_e03_01",
+          "scope": "subject",
+          "at": "2026-08-01T10:02:00.000Z",
+          "review_state": "approved",
+          "memory": {
+            "kind": "semantic",
+            "category": "temporary_marker",
+            "key": "expiry_beacon",
+            "value": "EXPIRY-BEACON-9033",
+            "person": "self",
+            "relationship": "self",
+            "backstory": "A temporary exact-match beacon for the expiration boundary.",
+            "expires_at": "2026-08-01T10:30:00.000Z"
+          },
+          "evidence": [
+            {
+              "alias": "e_e03_01",
+              "session_id": "temporary-marker",
+              "actor": "user",
+              "content": "Keep temporary marker EXPIRY-BEACON-9033 until 10:30 UTC.",
+              "occurred_at": "2026-08-01T10:01:00.000Z"
+            }
+          ]
+        },
+        {
+          "op": "query",
+          "id": "q_e03",
+          "scope": "subject",
+          "at": "2026-08-01T10:30:00.000Z",
+          "text": "What is temporary marker EXPIRY-BEACON-9033?",
+          "judgments": {
+            "memory_cards": {
+              "forbidden": [
+                "m_e03_01"
+              ],
+              "require_empty": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "e04",
+      "description": "A highly relevant expired mixed-language distractor must be excluded while the current serviceable region remains recallable.",
+      "tags": [
+        "lifecycle_non_recall",
+        "lang_mixed",
+        "current_domain",
+        "expiration",
+        "expired_distractor"
+      ],
+      "scopes": [
+        {
+          "id": "subject",
+          "tenant_id": "tenant-e04",
+          "user_id": "user-e04"
+        }
+      ],
+      "timeline": [
+        {
+          "op": "memory.remember",
+          "memory_ref": "m_e04_01",
+          "scope": "subject",
+          "at": "2026-08-01T10:02:00.000Z",
+          "review_state": "approved",
+          "memory": {
+            "kind": "semantic",
+            "category": "deployment",
+            "key": "historical_region",
+            "value": "Project Aurora current deploy region ap-southeast-1 新加坡",
+            "person": "Project Aurora",
+            "relationship": "deployment target",
+            "backstory": "An exact-query lexical distractor that has expired.",
+            "expires_at": "2026-08-01T10:20:00.000Z"
+          },
+          "evidence": [
+            {
+              "alias": "e_e04_01",
+              "session_id": "aurora-history",
+              "actor": "user",
+              "content": "Project Aurora current deploy region was ap-southeast-1 新加坡 for the temporary rollout.",
+              "occurred_at": "2026-08-01T10:01:00.000Z"
+            }
+          ]
+        },
+        {
+          "op": "memory.remember",
+          "memory_ref": "m_e04_02",
+          "scope": "subject",
+          "at": "2026-08-01T10:04:00.000Z",
+          "review_state": "approved",
+          "memory": {
+            "kind": "semantic",
+            "category": "deployment",
+            "key": "current_region",
+            "value": "Project Aurora 当前 deploy region ap-northeast-1 东京",
+            "person": "Project Aurora",
+            "relationship": "deployment target",
+            "backstory": "The current serviceable deployment region."
+          },
+          "evidence": [
+            {
+              "alias": "e_e04_02",
+              "session_id": "aurora-current",
+              "actor": "user",
+              "content": "Project Aurora 当前 deploy region 是 ap-northeast-1 东京。",
+              "occurred_at": "2026-08-01T10:03:00.000Z"
+            }
+          ]
+        },
+        {
+          "op": "query",
+          "id": "q_e04",
+          "scope": "subject",
+          "at": "2026-08-01T10:30:00.000Z",
+          "text": "Project Aurora 当前 deploy region 是哪个区域？",
+          "judgments": {
+            "memory_cards": {
+              "relevance": {
+                "m_e04_02": 3
+              },
+              "forbidden": [
+                "m_e04_01"
               ]
             }
           }

@@ -22,7 +22,7 @@ const (
 )
 
 type Retriever interface {
-	Search(context.Context, string, string, string, int) ([]domain.SearchHit, error)
+	Search(context.Context, string, string, string, int, time.Time) ([]domain.SearchHit, error)
 }
 
 type IDGenerator func(string) (string, error)
@@ -150,6 +150,7 @@ type ProposeCandidateInput struct {
 	Extractor        string
 	ExtractorVersion string
 	Metadata         map[string]string
+	ExpiresAt        *time.Time
 }
 
 func (s *Service) ProposeCandidate(ctx context.Context, input ProposeCandidateInput) (domain.MemoryCandidate, error) {
@@ -186,6 +187,9 @@ func (s *Service) ProposeCandidate(ctx context.Context, input ProposeCandidateIn
 	if err := validateMetadata(input.Metadata); err != nil {
 		return domain.MemoryCandidate{}, err
 	}
+	if input.ExpiresAt != nil && input.ExpiresAt.IsZero() {
+		return domain.MemoryCandidate{}, invalid("expires_at must be a non-zero timestamp")
+	}
 
 	sourceEventIDs, err := uniqueIdentifiers("source_event_ids", input.SourceEventIDs, maxSourceEvents)
 	if err != nil {
@@ -215,6 +219,7 @@ func (s *Service) ProposeCandidate(ctx context.Context, input ProposeCandidateIn
 		ExtractorVersion: strings.TrimSpace(input.ExtractorVersion),
 		Status:           domain.CandidatePending,
 		CreatedAt:        s.now().UTC(),
+		ExpiresAt:        cloneTime(input.ExpiresAt),
 		Metadata:         cloneMap(input.Metadata),
 	}
 	if err := s.store.CreateCandidate(ctx, candidate); err != nil {
@@ -296,12 +301,13 @@ func (s *Service) BuildContext(ctx context.Context, input BuildContextInput) (do
 	tenantID := strings.TrimSpace(input.TenantID)
 	userID := strings.TrimSpace(input.UserID)
 	query := strings.TrimSpace(input.Query)
+	asOf := s.now().UTC()
 	for attempt := 0; attempt < 3; attempt++ {
 		startRevision, err := s.store.ContextRevision(ctx, tenantID, userID)
 		if err != nil {
 			return domain.ContextPack{}, err
 		}
-		hits, err := s.retriever.Search(ctx, tenantID, userID, query, limit)
+		hits, err := s.retriever.Search(ctx, tenantID, userID, query, limit, asOf)
 		if err != nil {
 			return domain.ContextPack{}, err
 		}
@@ -311,7 +317,7 @@ func (s *Service) BuildContext(ctx context.Context, input BuildContextInput) (do
 			if hit.Memory.TenantID != tenantID || hit.Memory.UserID != userID {
 				return domain.ContextPack{}, fmt.Errorf("retriever returned a memory outside the requested scope: %w", domain.ErrInvariant)
 			}
-			if hit.Memory.Status != domain.MemoryActive || len(hit.Memory.SourceEventIDs) == 0 {
+			if !hit.Memory.ServiceableAt(asOf) || len(hit.Memory.SourceEventIDs) == 0 {
 				return domain.ContextPack{}, fmt.Errorf("retriever returned a non-serviceable memory: %w", domain.ErrInvariant)
 			}
 			sources, err := s.store.EvidenceByIDs(ctx, tenantID, userID, hit.Memory.SourceEventIDs)
@@ -336,7 +342,7 @@ func (s *Service) BuildContext(ctx context.Context, input BuildContextInput) (do
 			UserID:      userID,
 			Query:       query,
 			Items:       items,
-			GeneratedAt: s.now().UTC(),
+			GeneratedAt: asOf,
 		}, nil
 	}
 	return domain.ContextPack{}, fmt.Errorf("context changed during retrieval; retry request: %w", domain.ErrConflict)
@@ -466,4 +472,15 @@ func cloneMap(input map[string]string) map[string]string {
 		output[key] = value
 	}
 	return output
+}
+
+func cloneTime(input *time.Time) *time.Time {
+	if input == nil {
+		return nil
+	}
+	// PostgreSQL timestamptz and pgx use microsecond precision. Canonicalizing
+	// at the application boundary keeps the create response, durable reloads,
+	// the in-memory adapter, and the exclusive expiration comparison identical.
+	value := input.UTC().Truncate(time.Microsecond)
+	return &value
 }

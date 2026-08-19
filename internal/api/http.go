@@ -174,6 +174,7 @@ type proposeCandidateRequest struct {
 	Extractor        string            `json:"extractor"`
 	ExtractorVersion string            `json:"extractor_version"`
 	Metadata         map[string]string `json:"metadata"`
+	ExpiresAt        *time.Time        `json:"expires_at"`
 }
 
 func (handler *Handler) proposeCandidate(writer http.ResponseWriter, request *http.Request) {
@@ -200,6 +201,7 @@ func (handler *Handler) proposeCandidate(writer http.ResponseWriter, request *ht
 		Extractor:        payload.Extractor,
 		ExtractorVersion: payload.ExtractorVersion,
 		Metadata:         payload.Metadata,
+		ExpiresAt:        payload.ExpiresAt,
 	})
 	if err != nil {
 		writeError(writer, err)

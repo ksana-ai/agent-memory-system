@@ -253,6 +253,7 @@ func (state *caseRuntimeV2) proposeCandidate(ctx context.Context, alias, scopeID
 		Kind: memory.Kind, Category: memory.Category, Key: memory.Key, Value: memory.Value,
 		Person: memory.Person, Relationship: memory.Relationship, Backstory: memory.Backstory,
 		SourceEventIDs: sourceIDs, Extractor: extractor, ExtractorVersion: extractorVersion, Metadata: metadata,
+		ExpiresAt: memory.ExpiresAt,
 	})
 	if err == nil {
 		expectedID := stableArtifactIDV2("cand", state.testCase.ID, alias)
@@ -261,7 +262,7 @@ func (state *caseRuntimeV2) proposeCandidate(ctx context.Context, alias, scopeID
 			Kind: memory.Kind, Category: strings.TrimSpace(memory.Category), Key: strings.TrimSpace(memory.Key), Value: strings.TrimSpace(memory.Value),
 			Person: strings.TrimSpace(memory.Person), Relationship: strings.TrimSpace(memory.Relationship), Backstory: strings.TrimSpace(memory.Backstory),
 			SourceEventIDs: append([]string(nil), sourceIDs...), Extractor: strings.TrimSpace(extractor), ExtractorVersion: strings.TrimSpace(extractorVersion),
-			Status: domain.CandidatePending, CreatedAt: state.logicalNow.UTC(), Metadata: maps.Clone(metadata),
+			Status: domain.CandidatePending, CreatedAt: state.logicalNow.UTC(), ExpiresAt: cloneOptionalTimeV2(memory.ExpiresAt), Metadata: maps.Clone(metadata),
 		}
 		if !memoryCandidatesEqualV2(candidate, expected) {
 			return fmt.Errorf("candidate %q differs from authored fixture", alias)
@@ -361,7 +362,7 @@ func (state *caseRuntimeV2) expectedApprovedMemoryV2(alias, scopeID string, cand
 		TenantID: candidate.TenantID, UserID: candidate.UserID, Kind: candidate.Kind, Category: candidate.Category,
 		Key: candidate.Key, Value: candidate.Value, Person: candidate.Person, Relationship: candidate.Relationship,
 		Backstory: candidate.Backstory, SourceEventIDs: append([]string(nil), candidate.SourceEventIDs...),
-		Version: version, Status: domain.MemoryActive, CreatedAt: createdAt,
+		Version: version, Status: domain.MemoryActive, CreatedAt: createdAt, ExpiresAt: cloneOptionalTimeV2(candidate.ExpiresAt),
 	}
 }
 
@@ -448,7 +449,7 @@ func (state *caseRuntimeV2) query(ctx context.Context, query *QueryV2, descripto
 		result.ExecutionError = executionErr.Error()
 	}
 	policyPacks := append(append([]domain.ContextPack(nil), warmupPacks...), measuredPacks...)
-	result.Policy = state.policyV2(scope, state.timed.allObservations(), profile, policyPacks, executionErr, depth)
+	result.Policy = state.policyV2(scope, query.At, state.timed.allObservations(), profile, policyPacks, executionErr, depth)
 	if len(profile.Relevance) > 0 {
 		quality, qualityErr := qualityV2(hits, state.memoryAliases, profile.Relevance, config.RecallK, config.NDCGK)
 		if qualityErr != nil {
@@ -524,7 +525,7 @@ func qualityV2(hits []domain.SearchHit, aliases map[string]string, relevance map
 	}, nil
 }
 
-func (state *caseRuntimeV2) policyV2(scope ScopeV2, searches [][]domain.SearchHit, profile JudgmentProfileV2, packs []domain.ContextPack, executionErr error, depth int) QueryPolicyV2 {
+func (state *caseRuntimeV2) policyV2(scope ScopeV2, asOf time.Time, searches [][]domain.SearchHit, profile JudgmentProfileV2, packs []domain.ContextPack, executionErr error, depth int) QueryPolicyV2 {
 	forbidden := make(map[string]struct{}, len(profile.Forbidden))
 	for _, alias := range profile.Forbidden {
 		forbidden[alias] = struct{}{}
@@ -554,6 +555,9 @@ func (state *caseRuntimeV2) policyV2(scope ScopeV2, searches [][]domain.SearchHi
 			logical := state.memoryState[alias]
 			if hit.Memory.Status != domain.MemoryActive || (logical != nil && (!logical.Active || logical.Deleted)) {
 				policy.NonActiveHits++
+			}
+			if hit.Memory.ExpiresAt != nil && !hit.Memory.ExpiresAt.After(asOf) {
+				policy.ExpiredHits++
 			}
 			if logical != nil && !memoryCardsEqualV2(hit.Memory, logical.Expected) {
 				policy.MemoryPayloadViolations++
@@ -595,7 +599,7 @@ func (state *caseRuntimeV2) policyV2(scope ScopeV2, searches [][]domain.SearchHi
 			}
 		}
 	}
-	policy.Passed = executionErr == nil && policy.ForbiddenHits == 0 && !policy.RequireEmptyFailure && policy.ScopeViolations == 0 && policy.NonActiveHits == 0 && policy.UnknownHits == 0 && policy.DuplicateHits == 0 && policy.OverLimitHits == 0 && policy.UnknownSourceIDs == 0 && policy.MissingSources == 0 && policy.ReorderedSources == 0 && policy.SourceScopeViolations == 0 && policy.MemoryPayloadViolations == 0 && policy.EvidencePayloadViolations == 0
+	policy.Passed = executionErr == nil && policy.ForbiddenHits == 0 && !policy.RequireEmptyFailure && policy.ScopeViolations == 0 && policy.NonActiveHits == 0 && policy.ExpiredHits == 0 && policy.UnknownHits == 0 && policy.DuplicateHits == 0 && policy.OverLimitHits == 0 && policy.UnknownSourceIDs == 0 && policy.MissingSources == 0 && policy.ReorderedSources == 0 && policy.SourceScopeViolations == 0 && policy.MemoryPayloadViolations == 0 && policy.EvidencePayloadViolations == 0
 	return policy
 }
 
@@ -628,6 +632,7 @@ func summarizeArmV2(queries []QueryResultV2) (ArmAggregateV2, error) {
 		}
 		aggregate.ScopeViolations += query.Policy.ScopeViolations
 		aggregate.NonActiveHits += query.Policy.NonActiveHits
+		aggregate.ExpiredHits += query.Policy.ExpiredHits
 		aggregate.UnknownHits += query.Policy.UnknownHits
 		aggregate.DuplicateHits += query.Policy.DuplicateHits
 		aggregate.OverLimitHits += query.Policy.OverLimitHits
@@ -685,9 +690,9 @@ type timedRetrieverV2 struct {
 	observations [][]domain.SearchHit
 }
 
-func (retriever *timedRetrieverV2) Search(ctx context.Context, tenantID, userID, query string, limit int) ([]domain.SearchHit, error) {
+func (retriever *timedRetrieverV2) Search(ctx context.Context, tenantID, userID, query string, limit int, asOf time.Time) ([]domain.SearchHit, error) {
 	started := retriever.timer.Now()
-	hits, err := retriever.inner.Search(ctx, tenantID, userID, query, limit)
+	hits, err := retriever.inner.Search(ctx, tenantID, userID, query, limit, asOf)
 	elapsed := retriever.timer.Now().Sub(started)
 	if elapsed < 0 {
 		return nil, errors.New("monotonic evaluation timer moved backwards")
@@ -771,7 +776,15 @@ func memoryCardsEqualV2(left, right domain.MemoryCard) bool {
 		left.Kind == right.Kind && left.Category == right.Category && left.Key == right.Key && left.Value == right.Value &&
 		left.Person == right.Person && left.Relationship == right.Relationship && left.Backstory == right.Backstory &&
 		slices.Equal(left.SourceEventIDs, right.SourceEventIDs) && left.Version == right.Version && left.Status == right.Status &&
-		left.CreatedAt.Equal(right.CreatedAt) && equalOptionalTimeV2(left.SupersededAt, right.SupersededAt)
+		left.CreatedAt.Equal(right.CreatedAt) && equalOptionalTimeV2(left.ExpiresAt, right.ExpiresAt) && equalOptionalTimeV2(left.SupersededAt, right.SupersededAt)
+}
+
+func cloneOptionalTimeV2(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func equalOptionalTimeV2(left, right *time.Time) bool {
@@ -792,7 +805,8 @@ func memoryCandidatesEqualV2(left, right domain.MemoryCandidate) bool {
 		left.Kind == right.Kind && left.Category == right.Category && left.Key == right.Key && left.Value == right.Value &&
 		left.Person == right.Person && left.Relationship == right.Relationship && left.Backstory == right.Backstory &&
 		slices.Equal(left.SourceEventIDs, right.SourceEventIDs) && left.Extractor == right.Extractor && left.ExtractorVersion == right.ExtractorVersion &&
-		left.Status == right.Status && candidateReviewsEqualV2(left.Review, right.Review) && left.CreatedAt.Equal(right.CreatedAt) && maps.Equal(left.Metadata, right.Metadata)
+		left.Status == right.Status && candidateReviewsEqualV2(left.Review, right.Review) && left.CreatedAt.Equal(right.CreatedAt) &&
+		equalOptionalTimeV2(left.ExpiresAt, right.ExpiresAt) && maps.Equal(left.Metadata, right.Metadata)
 }
 
 func candidateReviewsEqualV2(left, right *domain.CandidateReview) bool {

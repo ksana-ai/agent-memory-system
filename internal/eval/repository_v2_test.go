@@ -22,7 +22,7 @@ func TestRepositoryLifecycleDatasetV2RunsEveryBuiltinArm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load repository v2 dataset: %v", err)
 	}
-	if dataset.ID != "memory-lifecycle-hard-v2" || dataset.Version != "2.0.0" || len(dataset.Cases) != 28 || countQueriesV2(dataset) != 28 {
+	if dataset.ID != "memory-lifecycle-hard-v2" || dataset.Version != "2.1.0" || len(dataset.Cases) != 30 || countQueriesV2(dataset) != 30 {
 		t.Fatalf("unexpected repository dataset metadata: id=%q version=%q cases=%d queries=%d", dataset.ID, dataset.Version, len(dataset.Cases), countQueriesV2(dataset))
 	}
 
@@ -34,8 +34,9 @@ func TestRepositoryLifecycleDatasetV2RunsEveryBuiltinArm(t *testing.T) {
 	}
 	for tag, want := range map[string]int{
 		"direct": 6, "multi_session_entity": 6, "update_conflict": 6,
-		"language_hard": 4, "lifecycle_non_recall": 2, "scope_adversarial": 4,
-		"lang_en": 9, "lang_zh": 10, "lang_mixed": 9,
+		"language_hard": 4, "lifecycle_non_recall": 4, "scope_adversarial": 4,
+		"lang_en": 10, "lang_zh": 10, "lang_mixed": 10,
+		"expiration": 2, "expiration_boundary": 1, "expired_distractor": 1,
 	} {
 		if tagCounts[tag] != want {
 			t.Errorf("tag %q count = %d, want %d", tag, tagCounts[tag], want)
@@ -61,7 +62,7 @@ func TestRepositoryLifecycleDatasetV2RunsEveryBuiltinArm(t *testing.T) {
 		t.Fatalf("unexpected no-memory baseline: %#v", noMemory.Aggregate)
 	}
 	bm25 := findArmResultV2(t, manifest, ArmReviewedCardsBM25V1)
-	if bm25.Aggregate.QueryCount != 28 || bm25.Aggregate.QualityQueryCount != 23 || bm25.Aggregate.NonRecallQueryCount != 5 {
+	if bm25.Aggregate.QueryCount != 30 || bm25.Aggregate.QualityQueryCount != 24 || bm25.Aggregate.NonRecallQueryCount != 6 {
 		t.Fatalf("unexpected BM25 query counts: %#v", bm25.Aggregate)
 	}
 	if bm25.Aggregate.RecallAtK < 0.95 || bm25.Aggregate.MRR < 0.95 || bm25.Aggregate.NDCGAtK < 0.95 || bm25.Aggregate.PassRate < 0.95 {
@@ -71,7 +72,7 @@ func TestRepositoryLifecycleDatasetV2RunsEveryBuiltinArm(t *testing.T) {
 		t.Fatalf("BM25 policy gate failed: %#v", bm25.Aggregate)
 	}
 	if bm25.Aggregate.ForbiddenHits != 0 || bm25.Aggregate.RequireEmptyFailures != 0 ||
-		bm25.Aggregate.ScopeViolations != 0 || bm25.Aggregate.NonActiveHits != 0 ||
+		bm25.Aggregate.ScopeViolations != 0 || bm25.Aggregate.NonActiveHits != 0 || bm25.Aggregate.ExpiredHits != 0 ||
 		bm25.Aggregate.UnknownHits != 0 || bm25.Aggregate.DuplicateHits != 0 || bm25.Aggregate.OverLimitHits != 0 ||
 		bm25.Aggregate.UnknownSourceIDs != 0 || bm25.Aggregate.MissingSources != 0 ||
 		bm25.Aggregate.ReorderedSources != 0 || bm25.Aggregate.SourceScopeViolations != 0 ||

@@ -20,7 +20,7 @@ Store port ──────────────► PostgreSQL adapter ◄�
                          + pgvector extension
 ```
 
-BM25 loads active cards from PostgreSQL on each search; it is not a separate materialized index. The in-memory Store adapter is retained for unit tests and deterministic offline evaluation only. The server binary has no memory fallback.
+BM25 loads serviceable cards from PostgreSQL on each search; it is not a separate materialized index. Serviceable means active and either without `expires_at` or with `expires_at` strictly after the request's `as_of` time. The in-memory Store adapter is retained for unit tests and deterministic offline evaluation only. The server binary has no memory fallback.
 
 ## Data layers
 
@@ -32,7 +32,7 @@ The PostgreSQL primary key is `(tenant_id, user_id, id)`, so a caller-chosen eve
 
 ### Candidate
 
-`MemoryCandidate` is an untrusted proposal. It carries a memory kind, Advanced-JSON-Card-style fields, extractor identity/version, metadata, and one or more ordered source event IDs. Creating it never makes it retrievable.
+`MemoryCandidate` is an untrusted proposal. It carries a memory kind, Advanced-JSON-Card-style fields, extractor identity/version, metadata, an optional absolute `expires_at`, and one or more ordered source event IDs. Creating it never makes it retrievable.
 
 The service performs an early source lookup for a useful API error. The PostgreSQL adapter repeats that validation while holding the scope transaction lock; correctness does not depend on the earlier check.
 
@@ -46,11 +46,13 @@ Approval creates a `MemoryCard`. Its identity is the normalized tuple:
 
 Go trims and lowercases each field. A length-delimited SHA-256 key addresses the identity chain, while the normalized fields are also stored under `C` collation and protected by a natural unique constraint. PostgreSQL locale-specific `lower()` is deliberately not used, avoiding Go/database normalization drift.
 
+Approving a candidate copies its optional `expires_at` to the card. The application canonicalizes it to UTC microsecond precision, matching PostgreSQL `timestamptz`. Expiration is an availability boundary, not a lifecycle transition: an expired card remains `active` for audit/version semantics but is not serviceable. Equality is expired (`expires_at <= as_of`).
+
 Approving another candidate with the same identity supersedes the active version and creates version `n+1`. This is deterministic last-approved-wins behavior, not semantic conflict resolution.
 
 ### Context Pack
 
-A Context Pack is a request-scoped projection, not another persistent memory type. It contains ranked active cards and their ordered source evidence. The calling agent remains responsible for prompt ordering, token budgets, truncation, and instruction/data separation.
+A Context Pack is a request-scoped projection, not another persistent memory type. It captures one `as_of` value for retries, retrieval filtering, a final fail-closed serviceability check, and `generated_at`. It contains ranked serviceable cards and their ordered source evidence. The calling agent remains responsible for prompt ordering, token budgets, truncation, and instruction/data separation.
 
 ## Transaction and lock model
 
@@ -70,7 +72,7 @@ Candidate approval runs in one transaction:
 3. Insert or lock the normalized identity chain.
 4. Compute the next version and a timestamp strictly later than the prior version.
 5. Supersede the current active card, if any.
-6. Insert the new active card and advance the identity chain.
+6. Insert the new active card, including the candidate's optional expiration, and advance the identity chain.
 7. Mark the candidate approved and increment the context revision.
 8. Commit.
 
@@ -98,7 +100,7 @@ Docker Compose pins `pgvector/pgvector:0.8.6-pg18-bookworm`, binds PostgreSQL to
 
 Versioned SQL is embedded into both `cmd/migrate` and `cmd/server`. Tern applies each migration transactionally and serializes concurrent migrators with an advisory lock. Migrations do not rely on `/docker-entrypoint-initdb.d`, so an existing named volume can be upgraded.
 
-The initial migration installs pgvector but intentionally creates no embedding column or ANN index. Vector dimensions and distance semantics must follow a measured embedding choice, not precede one.
+The initial migration installs pgvector but intentionally creates no embedding column or ANN index. A second migration adds candidate/card expiration and the serviceability lookup index. Vector dimensions and distance semantics must follow a measured embedding choice, not precede one.
 
 ## Trust boundaries
 

@@ -15,7 +15,7 @@ Use three distinct records:
 2. `MemoryCandidate` records hold extractor proposals and remain non-serviceable.
 3. Reviewed `MemoryCard` records provide the versioned, retrievable projection.
 
-Every card is linked to its candidate and source evidence. Candidate approval is the only transition that creates a card. Conflicting approved identities form a version chain with one active card.
+Every card is linked to its candidate and source evidence. Candidate approval is the only transition that creates a card. Conflicting approved identities form a version chain with one active card. An optional absolute expiration is copied from candidate to card; it controls request-time serviceability without rewriting lifecycle status.
 
 ## Consequences
 

@@ -79,7 +79,7 @@ func TestConcurrentReviewHasOneWinner(t *testing.T) {
 	if successes != 1 || conflicts != 1 {
 		t.Fatalf("successes=%d conflicts=%d, want 1/1", successes, conflicts)
 	}
-	active, err := storage.ListActiveMemories(context.Background(), candidate.TenantID, candidate.UserID)
+	active, err := storage.ListServiceableMemories(context.Background(), candidate.TenantID, candidate.UserID, time.Now().UTC())
 	if err != nil || len(active) != 1 {
 		t.Fatalf("active=%#v error=%v", active, err)
 	}
@@ -127,9 +127,50 @@ func TestConcurrentConflictingCandidatesFormVersionChain(t *testing.T) {
 	if !gotVersions[1] || !gotVersions[2] || len(gotVersions) != 2 {
 		t.Fatalf("versions=%v, want {1,2}", gotVersions)
 	}
-	active, err := storage.ListActiveMemories(context.Background(), "tenant", "user")
+	active, err := storage.ListServiceableMemories(context.Background(), "tenant", "user", time.Now().UTC())
 	if err != nil || len(active) != 1 || active[0].Version != 2 {
 		t.Fatalf("active=%#v error=%v", active, err)
+	}
+}
+
+func TestListServiceableMemoriesFiltersExpirationWithoutChangingStatus(t *testing.T) {
+	storage := memstore.New()
+	asOf := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	past := asOf.Add(-time.Second)
+	equal := asOf
+	future := asOf.Add(time.Second)
+
+	for _, fixture := range []struct {
+		id        string
+		expiresAt *time.Time
+	}{
+		{id: "past", expiresAt: &past},
+		{id: "equal", expiresAt: &equal},
+		{id: "future", expiresAt: &future},
+		{id: "none"},
+	} {
+		candidate := seedCandidateWithExpiration(t, storage, "candidate-"+fixture.id, "key-"+fixture.id, fixture.id, fixture.expiresAt)
+		_, memory, err := storage.ReviewCandidate(context.Background(), store.CandidateReviewCommand{
+			TenantID: candidate.TenantID, UserID: candidate.UserID, CandidateID: candidate.ID, MemoryID: "memory-" + fixture.id,
+			Review: domain.CandidateReview{Decision: domain.DecisionApprove, ReviewerID: "reviewer", Reason: "supported", ReviewedAt: asOf.Add(-time.Hour)},
+		})
+		if err != nil {
+			t.Fatalf("review %s: %v", fixture.id, err)
+		}
+		if memory.Status != domain.MemoryActive || (fixture.expiresAt != nil && (memory.ExpiresAt == nil || !memory.ExpiresAt.Equal(*fixture.expiresAt))) {
+			t.Fatalf("reviewed memory %s lost active status or expiration: %#v", fixture.id, memory)
+		}
+	}
+	serviceable, err := storage.ListServiceableMemories(context.Background(), "tenant", "user", asOf)
+	if err != nil {
+		t.Fatalf("list serviceable: %v", err)
+	}
+	got := make(map[string]bool, len(serviceable))
+	for _, memory := range serviceable {
+		got[memory.ID] = true
+	}
+	if len(got) != 2 || !got["memory-future"] || !got["memory-none"] {
+		t.Fatalf("serviceable memories = %#v, want future and none", serviceable)
 	}
 }
 
@@ -160,6 +201,10 @@ func TestCardCommitTimeIsMonotonicWhenReviewTimesArriveOutOfOrder(t *testing.T) 
 }
 
 func seedCandidate(t *testing.T, storage *memstore.Store, candidateID, key, value string) domain.MemoryCandidate {
+	return seedCandidateWithExpiration(t, storage, candidateID, key, value, nil)
+}
+
+func seedCandidateWithExpiration(t *testing.T, storage *memstore.Store, candidateID, key, value string, expiresAt *time.Time) domain.MemoryCandidate {
 	t.Helper()
 	eventID := "event-" + candidateID
 	event := domain.EvidenceEvent{ID: eventID, TenantID: "tenant", UserID: "user", SessionID: "session", Actor: domain.ActorUser, Content: value}
@@ -169,7 +214,7 @@ func seedCandidate(t *testing.T, storage *memstore.Store, candidateID, key, valu
 	candidate := domain.MemoryCandidate{
 		ID: candidateID, TenantID: "tenant", UserID: "user", Kind: domain.MemoryKindSemantic,
 		Category: "travel", Key: key, Value: value, Person: "self", Relationship: "self",
-		SourceEventIDs: []string{eventID}, Status: domain.CandidatePending,
+		SourceEventIDs: []string{eventID}, Status: domain.CandidatePending, ExpiresAt: expiresAt,
 	}
 	if err := storage.CreateCandidate(context.Background(), candidate); err != nil {
 		t.Fatalf("create candidate: %v", err)

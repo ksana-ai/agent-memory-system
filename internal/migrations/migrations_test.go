@@ -22,14 +22,23 @@ func TestEmbeddedMigrationsLoad(t *testing.T) {
 	if err := migrator.LoadMigrations(files); err != nil {
 		t.Fatalf("load migrations: %v", err)
 	}
-	if len(migrator.Migrations) != 1 {
-		t.Fatalf("migration count = %d, want 1", len(migrator.Migrations))
+	if len(migrator.Migrations) != 2 {
+		t.Fatalf("migration count = %d, want 2", len(migrator.Migrations))
 	}
 	if !strings.Contains(migrator.Migrations[0].UpSQL, "CREATE TABLE agent_memory.memory_cards") {
 		t.Fatal("initial migration does not create memory_cards")
 	}
 	if !strings.Contains(migrator.Migrations[0].DownSQL, "DROP SCHEMA IF EXISTS agent_memory CASCADE") {
 		t.Fatal("initial migration does not define its rollback")
+	}
+	if !strings.Contains(migrator.Migrations[1].UpSQL, "ADD COLUMN expires_at timestamptz") {
+		t.Fatal("expiration migration does not add expires_at")
+	}
+	if !strings.Contains(migrator.Migrations[1].UpSQL, "memory_cards_scope_serviceable_expiry_idx") {
+		t.Fatal("expiration migration does not add its serviceability index")
+	}
+	if !strings.Contains(migrator.Migrations[1].DownSQL, "DROP COLUMN IF EXISTS expires_at") {
+		t.Fatal("expiration migration does not define its rollback")
 	}
 }
 

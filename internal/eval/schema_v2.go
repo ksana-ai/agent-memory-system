@@ -96,6 +96,7 @@ type MemorySpecV2 struct {
 	Person       string            `json:"person,omitempty"`
 	Relationship string            `json:"relationship,omitempty"`
 	Backstory    string            `json:"backstory,omitempty"`
+	ExpiresAt    *time.Time        `json:"expires_at,omitempty"`
 }
 
 type CandidateReviewV2 struct {
@@ -311,6 +312,7 @@ type artifactStateV2 struct {
 	deleted     bool
 	serviceable bool
 	identity    memoryIdentityV2
+	expiresAt   *time.Time
 	candidate   *candidateStateV2
 }
 
@@ -598,6 +600,7 @@ func validateTimelineOperationV2(
 			}
 			memory := artifacts[value.MemoryAs]
 			memory.identity = identity
+			memory.expiresAt = candidate.candidate.memory.ExpiresAt
 			memory.serviceable = true
 			activeMemories[identityKey] = value.MemoryAs
 		case domain.DecisionReject:
@@ -659,6 +662,7 @@ func validateTimelineOperationV2(
 		}
 		memory := artifacts[value.MemoryRef]
 		memory.identity = normalizedMemoryIdentityV2(value.Memory)
+		memory.expiresAt = value.Memory.ExpiresAt
 		switch value.ReviewState {
 		case RememberApprovedV2:
 			identityKey := memoryIdentityKeyV2(value.Scope, memory.identity)
@@ -714,11 +718,11 @@ func validateTimelineOperationV2(
 		if value.Judgments.MemoryCards == nil {
 			return errors.New("query needs a memory_cards judgment profile")
 		}
-		if err := validateJudgmentProfileV2("memory_cards", *value.Judgments.MemoryCards, artifactMemoryV2, value.Scope, artifacts); err != nil {
+		if err := validateJudgmentProfileV2("memory_cards", *value.Judgments.MemoryCards, artifactMemoryV2, value.Scope, value.At, artifacts); err != nil {
 			return err
 		}
 		if value.Judgments.EvidenceEvents != nil {
-			if err := validateJudgmentProfileV2("evidence_events", *value.Judgments.EvidenceEvents, artifactEvidenceV2, value.Scope, artifacts); err != nil {
+			if err := validateJudgmentProfileV2("evidence_events", *value.Judgments.EvidenceEvents, artifactEvidenceV2, value.Scope, value.At, artifacts); err != nil {
 				return err
 			}
 		}
@@ -734,6 +738,7 @@ func validateJudgmentProfileV2(
 	profile JudgmentProfileV2,
 	wantKind artifactKindV2,
 	queryScope string,
+	queryAt time.Time,
 	artifacts map[string]*artifactStateV2,
 ) error {
 	if len(profile.Relevance) == 0 && len(profile.Forbidden) == 0 && !profile.RequireEmpty {
@@ -761,6 +766,9 @@ func validateJudgmentProfileV2(
 		}
 		if wantKind == artifactMemoryV2 && !artifact.serviceable {
 			return fmt.Errorf("%s relevance alias %q is not an active memory", name, alias)
+		}
+		if wantKind == artifactMemoryV2 && artifact.expiresAt != nil && !queryAt.Before(*artifact.expiresAt) {
+			return fmt.Errorf("%s relevance alias %q expired at %s before or at query %s", name, alias, artifact.expiresAt.Format(time.RFC3339Nano), queryAt.Format(time.RFC3339Nano))
 		}
 	}
 
@@ -827,7 +835,13 @@ func validateMemorySpecV2(memory MemorySpecV2) error {
 	if err := validateOptionalLabelV2("memory relationship", memory.Relationship, 256); err != nil {
 		return err
 	}
-	return validateOptionalTextV2("memory backstory", memory.Backstory, 2<<10)
+	if err := validateOptionalTextV2("memory backstory", memory.Backstory, 2<<10); err != nil {
+		return err
+	}
+	if memory.ExpiresAt != nil && memory.ExpiresAt.IsZero() {
+		return errors.New("memory expires_at must not be zero")
+	}
+	return nil
 }
 
 func validateIdentifierV2(name, value string) error {

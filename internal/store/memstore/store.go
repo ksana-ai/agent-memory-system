@@ -179,6 +179,7 @@ func (s *Store) ReviewCandidate(ctx context.Context, command store.CandidateRevi
 		Version:        1,
 		Status:         domain.MemoryActive,
 		CreatedAt:      command.Review.ReviewedAt,
+		ExpiresAt:      cloneTime(candidate.ExpiresAt),
 	}
 
 	latestCreatedAt := time.Time{}
@@ -225,7 +226,7 @@ func (s *Store) ContextRevision(ctx context.Context, tenantID, userID string) (u
 	return s.revisions[userScope{tenantID: tenantID, userID: userID}], nil
 }
 
-func (s *Store) ListActiveMemories(ctx context.Context, tenantID, userID string) ([]domain.MemoryCard, error) {
+func (s *Store) ListServiceableMemories(ctx context.Context, tenantID, userID string, asOf time.Time) ([]domain.MemoryCard, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -235,7 +236,7 @@ func (s *Store) ListActiveMemories(ctx context.Context, tenantID, userID string)
 
 	memories := make([]domain.MemoryCard, 0)
 	for _, memory := range s.memories {
-		if memory.TenantID == tenantID && memory.UserID == userID && memory.Status == domain.MemoryActive {
+		if memory.TenantID == tenantID && memory.UserID == userID && memory.ServiceableAt(asOf) {
 			memories = append(memories, cloneMemory(memory))
 		}
 	}
@@ -288,6 +289,7 @@ func cloneCandidate(candidate domain.MemoryCandidate) domain.MemoryCandidate {
 	candidate.SourceEventIDs = append([]string(nil), candidate.SourceEventIDs...)
 	candidate.Metadata = cloneMap(candidate.Metadata)
 	candidate.Review = cloneReview(candidate.Review)
+	candidate.ExpiresAt = cloneTime(candidate.ExpiresAt)
 	return candidate
 }
 
@@ -297,7 +299,16 @@ func cloneMemory(memory domain.MemoryCard) domain.MemoryCard {
 		value := *memory.SupersededAt
 		memory.SupersededAt = &value
 	}
+	memory.ExpiresAt = cloneTime(memory.ExpiresAt)
 	return memory
+}
+
+func cloneTime(input *time.Time) *time.Time {
+	if input == nil {
+		return nil
+	}
+	value := *input
+	return &value
 }
 
 func cloneReview(review *domain.CandidateReview) *domain.CandidateReview {

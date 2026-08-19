@@ -5,29 +5,29 @@
 The repository keeps two deliberately different contracts:
 
 - `datasets/retrieval-smoke-v1.json` is the unchanged 8-case compatibility smoke test. It uses flat, pre-approved fixtures and scores memory keys.
-- `datasets/memory-lifecycle-v2.json` is the current deterministic acceptance benchmark. It contains 28 cases and executes ordered, explicitly timed application operations across multiple sessions and tenant/user scopes.
+- `datasets/memory-lifecycle-v2.json` is the current deterministic acceptance benchmark. It contains 30 cases and executes ordered, explicitly timed application operations across multiple sessions and tenant/user scopes.
 
 The v2 runner never inserts a `MemoryCard` directly. Its compact `memory.remember` fixture expands to `IngestEvidence → ProposeCandidate → ReviewCandidate`; detailed operations are also supported. Other timeline steps exercise pending and rejected candidates, same-identity supersession, `ForgetUser`, and query checkpoints. Stable opaque aliases connect judgments to runtime IDs but are never written to memory fields, evidence content, or metadata.
 
 The strict Go loader in `internal/eval/schema_v2.go` is the schema authority. It rejects unknown fields, duplicate or forward-referenced aliases, decreasing logical time, cross-scope positive judgments, deleted or superseded positive judgments, and mutations made after loading. A second JSON Schema is intentionally not maintained because two independently evolving validators would create contract drift.
 
-The current 28 cases cover:
+The current 30 cases cover:
 
 - six direct factual recall scenarios;
 - six multi-session or multi-entity scenarios;
 - six updates, contradictions, or version-selection scenarios;
 - four Chinese or mixed-language paraphrase scenarios;
-- two lifecycle non-recall scenarios for rejection, pending state, and erasure;
+- four lifecycle non-recall scenarios for rejection, pending state, expiration, and erasure;
 - four adversarial tenant/user isolation scenarios.
 
-True time-based expiration is not represented. The current domain has no `expires_at` field or as-of serviceability rule, so fixture-side filtering would falsely claim a capability the service does not have. Two expiration cases remain deferred until that production semantics exists, bringing the next gate to 30 cases.
+Expiration cases execute the production serviceability rule rather than fixture-side filtering. `expires_at` is an exclusive boundary: a card whose expiration equals the query's logical `as_of` time is already expired. The second case combines an expired high-overlap distractor with a still-serviceable positive card.
 
 ## Retrieval arms
 
 Every selected arm receives an isolated case runtime and replays the same timeline. The built-in arms are:
 
 - `no-memory-v1`: returns no memories and provides an explicit ablation floor;
-- `reviewed-cards-bm25-v1`: runs the deterministic Go BM25 implementation over reviewed active cards in the in-memory Store.
+- `reviewed-cards-bm25-v1`: runs the deterministic Go BM25 implementation over reviewed active, unexpired cards in the in-memory Store.
 
 The server's PostgreSQL-backed BM25 path is not exercised by these two arms. PostgreSQL FTS and pgvector must be added as independent real-component arms rather than being inferred from the installed extension.
 
@@ -46,7 +46,7 @@ Queries with no positive judgments are excluded from all four quality denominato
 
 Negative and safety assertions are reported separately. A policy pass requires all of the following:
 
-- no explicitly forbidden, deleted, superseded, pending, rejected, foreign-scope, unknown, duplicate, over-limit, or non-active hit;
+- no explicitly forbidden, deleted, superseded, expired, pending, rejected, foreign-scope, unknown, duplicate, over-limit, or non-active hit;
 - a `require_empty` checkpoint returns no hit at all;
 - every returned card payload matches the approved fixture card for that runtime ID;
 - every source ID is known, remains in the requested tenant/user scope, and matches the authored source order;
@@ -93,7 +93,7 @@ The current v2 benchmark remains level 2. It evaluates retrieval over pre-author
 
 ## Next comparison
 
-After the two real expiration cases complete the 30-case gate, run the same memory-card judgments through:
+The next phase runs the same memory-card judgments through:
 
 ```text
 no memory → Go BM25 → PostgreSQL FTS → bge-m3/pgvector

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/kai443/go-agent-memory-system/internal/app"
 	"github.com/kai443/go-agent-memory-system/internal/domain"
@@ -128,7 +129,7 @@ func newReviewedCardsBM25Arm() ArmFactory {
 
 type emptyRetriever struct{ marker byte }
 
-func (*emptyRetriever) Search(context.Context, string, string, string, int) ([]domain.SearchHit, error) {
+func (*emptyRetriever) Search(context.Context, string, string, string, int, time.Time) ([]domain.SearchHit, error) {
 	return []domain.SearchHit{}, nil
 }
 

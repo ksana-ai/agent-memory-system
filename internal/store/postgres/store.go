@@ -184,16 +184,17 @@ func (s *Store) CreateCandidate(ctx context.Context, candidate domain.MemoryCand
 			INSERT INTO agent_memory.memory_candidates (
 				tenant_id, user_id, id, kind, category, memory_key, value,
 				person, relationship, backstory, extractor, extractor_version,
-				status, metadata, created_at
+				status, metadata, created_at, expires_at
 			) VALUES (
 				$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-				$13, $14, $15
+				$13, $14, $15, $16
 			)
 			ON CONFLICT (tenant_id, user_id, id) DO NOTHING`,
 			candidate.TenantID, candidate.UserID, candidate.ID, string(candidate.Kind),
 			candidate.Category, candidate.Key, candidate.Value, candidate.Person,
 			candidate.Relationship, candidate.Backstory, candidate.Extractor,
 			candidate.ExtractorVersion, string(candidate.Status), metadata, candidate.CreatedAt,
+			candidate.ExpiresAt,
 		)
 		if err != nil {
 			return mapPostgresError("create candidate", err)
@@ -279,6 +280,7 @@ func (s *Store) ReviewCandidate(ctx context.Context, command domainstore.Candida
 		Backstory:      candidate.Backstory,
 		SourceEventIDs: append([]string(nil), candidate.SourceEventIDs...),
 		Status:         domain.MemoryActive,
+		ExpiresAt:      cloneTime(candidate.ExpiresAt),
 	}
 	identity := card.Identity()
 	identityKey := encodeIdentity(identity)
@@ -358,14 +360,14 @@ func (s *Store) ReviewCandidate(ctx context.Context, command domainstore.Candida
 		INSERT INTO agent_memory.memory_cards (
 			tenant_id, user_id, id, candidate_id, identity_key, kind, category,
 			memory_key, value, person, relationship, backstory, version, status,
-			created_at
+			created_at, expires_at
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-			'active', $14
+			'active', $14, $15
 		)`,
 		card.TenantID, card.UserID, card.ID, card.CandidateID, identityKey,
 		string(card.Kind), card.Category, card.Key, card.Value, card.Person,
-		card.Relationship, card.Backstory, card.Version, card.CreatedAt,
+		card.Relationship, card.Backstory, card.Version, card.CreatedAt, card.ExpiresAt,
 	); err != nil {
 		return domain.MemoryCandidate{}, nil, mapPostgresError("create memory card", err)
 	}
@@ -403,7 +405,7 @@ func (s *Store) ReviewCandidate(ctx context.Context, command domainstore.Candida
 	return candidate, &card, nil
 }
 
-func (s *Store) ListActiveMemories(ctx context.Context, tenantID, userID string) ([]domain.MemoryCard, error) {
+func (s *Store) ListServiceableMemories(ctx context.Context, tenantID, userID string, asOf time.Time) ([]domain.MemoryCard, error) {
 	if err := s.ready(); err != nil {
 		return nil, err
 	}
@@ -419,12 +421,14 @@ func (s *Store) ListActiveMemories(ctx context.Context, tenantID, userID string)
 		             AND source.candidate_id = card.candidate_id
 		           ORDER BY source.source_order
 		       ), ARRAY[]::text[]),
-		       card.version, card.status, card.created_at, card.superseded_at
+		       card.version, card.status, card.created_at, card.expires_at,
+		       card.superseded_at
 		FROM agent_memory.memory_cards AS card
 		WHERE card.tenant_id = $1 AND card.user_id = $2 AND card.status = 'active'
-		ORDER BY card.created_at, card.id`, tenantID, userID)
+		  AND (card.expires_at IS NULL OR card.expires_at > $3)
+		ORDER BY card.created_at, card.id`, tenantID, userID, asOf)
 	if err != nil {
-		return nil, mapPostgresError("list active memories", err)
+		return nil, mapPostgresError("list serviceable memories", err)
 	}
 	defer rows.Close()
 
@@ -437,7 +441,7 @@ func (s *Store) ListActiveMemories(ctx context.Context, tenantID, userID string)
 		memories = append(memories, memory)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, mapPostgresError("iterate active memories", err)
+		return nil, mapPostgresError("iterate serviceable memories", err)
 	}
 	return memories, nil
 }
@@ -651,7 +655,7 @@ func readCandidate(ctx context.Context, queryer rowQueryer, tenantID, userID, ca
 		       candidate.extractor, candidate.extractor_version, candidate.status,
 		       candidate.review_decision, candidate.reviewer_id,
 		       candidate.review_reason, candidate.reviewed_at,
-		       candidate.created_at, candidate.metadata
+		       candidate.created_at, candidate.expires_at, candidate.metadata
 		FROM agent_memory.memory_candidates AS candidate
 		WHERE candidate.tenant_id = $1 AND candidate.user_id = $2 AND candidate.id = $3`
 	if forUpdate {
@@ -684,7 +688,7 @@ func scanCandidate(row rowScanner, requestedID string) (domain.MemoryCandidate, 
 	var candidate domain.MemoryCandidate
 	var kind, status string
 	var reviewDecision, reviewerID, reviewReason pgtype.Text
-	var reviewedAt pgtype.Timestamptz
+	var reviewedAt, expiresAt pgtype.Timestamptz
 	var metadata []byte
 	if err := row.Scan(
 		&candidate.ID, &candidate.TenantID, &candidate.UserID, &kind,
@@ -692,7 +696,7 @@ func scanCandidate(row rowScanner, requestedID string) (domain.MemoryCandidate, 
 		&candidate.Relationship, &candidate.Backstory, &candidate.SourceEventIDs,
 		&candidate.Extractor, &candidate.ExtractorVersion, &status,
 		&reviewDecision, &reviewerID, &reviewReason, &reviewedAt,
-		&candidate.CreatedAt, &metadata,
+		&candidate.CreatedAt, &expiresAt, &metadata,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.MemoryCandidate{}, fmt.Errorf("candidate %q: %w", requestedID, domain.ErrNotFound)
@@ -701,6 +705,9 @@ func scanCandidate(row rowScanner, requestedID string) (domain.MemoryCandidate, 
 	}
 	candidate.Kind = domain.MemoryKind(kind)
 	candidate.Status = domain.CandidateStatus(status)
+	if expiresAt.Valid {
+		candidate.ExpiresAt = cloneTime(&expiresAt.Time)
+	}
 	if reviewDecision.Valid || reviewerID.Valid || reviewReason.Valid || reviewedAt.Valid {
 		if !(reviewDecision.Valid && reviewerID.Valid && reviewReason.Valid && reviewedAt.Valid) {
 			return domain.MemoryCandidate{}, fmt.Errorf("candidate %q has a partial review: %w", candidate.ID, domain.ErrInvariant)
@@ -721,17 +728,20 @@ func scanCandidate(row rowScanner, requestedID string) (domain.MemoryCandidate, 
 func scanMemory(row rowScanner) (domain.MemoryCard, error) {
 	var memory domain.MemoryCard
 	var kind, status string
-	var supersededAt pgtype.Timestamptz
+	var expiresAt, supersededAt pgtype.Timestamptz
 	if err := row.Scan(
 		&memory.ID, &memory.CandidateID, &memory.TenantID, &memory.UserID, &kind,
 		&memory.Category, &memory.Key, &memory.Value, &memory.Person,
 		&memory.Relationship, &memory.Backstory, &memory.SourceEventIDs,
-		&memory.Version, &status, &memory.CreatedAt, &supersededAt,
+		&memory.Version, &status, &memory.CreatedAt, &expiresAt, &supersededAt,
 	); err != nil {
 		return domain.MemoryCard{}, mapPostgresError("scan memory", err)
 	}
 	memory.Kind = domain.MemoryKind(kind)
 	memory.Status = domain.MemoryStatus(status)
+	if expiresAt.Valid {
+		memory.ExpiresAt = cloneTime(&expiresAt.Time)
+	}
 	if supersededAt.Valid {
 		value := supersededAt.Time
 		memory.SupersededAt = &value
@@ -799,6 +809,14 @@ func cloneReview(review *domain.CandidateReview) *domain.CandidateReview {
 		return nil
 	}
 	cloned := *review
+	return &cloned
+}
+
+func cloneTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
 	return &cloned
 }
 

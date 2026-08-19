@@ -6,6 +6,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/kai443/go-agent-memory-system/internal/domain"
@@ -17,7 +18,7 @@ const (
 )
 
 type MemorySource interface {
-	ListActiveMemories(context.Context, string, string) ([]domain.MemoryCard, error)
+	ListServiceableMemories(context.Context, string, string, time.Time) ([]domain.MemoryCard, error)
 }
 
 // BM25 is a deterministic lexical baseline. It deliberately has no embedding
@@ -33,13 +34,13 @@ func NewBM25(source MemorySource) (*BM25, error) {
 	return &BM25{source: source}, nil
 }
 
-func (retriever *BM25) Search(ctx context.Context, tenantID, userID, query string, limit int) ([]domain.SearchHit, error) {
+func (retriever *BM25) Search(ctx context.Context, tenantID, userID, query string, limit int, asOf time.Time) ([]domain.SearchHit, error) {
 	queryTokens := tokenize(query)
 	if len(queryTokens) == 0 || limit <= 0 {
 		return []domain.SearchHit{}, nil
 	}
 
-	memories, err := retriever.source.ListActiveMemories(ctx, tenantID, userID)
+	memories, err := retriever.source.ListServiceableMemories(ctx, tenantID, userID, asOf)
 	if err != nil {
 		return nil, err
 	}

@@ -84,7 +84,7 @@ func TestPostgresStoreLifecyclePreservesSourceOrderAndScope(t *testing.T) {
 	if got := memory.SourceEventIDs; len(got) != 2 || got[0] != second.ID || got[1] != first.ID {
 		t.Fatalf("memory source order=%v, want [%s %s]", got, second.ID, first.ID)
 	}
-	active, err := storage.ListActiveMemories(ctx, tenantID, userID)
+	active, err := storage.ListServiceableMemories(ctx, tenantID, userID, fixtureTime(100))
 	if err != nil || len(active) != 1 || active[0].ID != memory.ID {
 		t.Fatalf("active=%#v error=%v", active, err)
 	}
@@ -150,7 +150,7 @@ func TestPostgresStoreConcurrentReviewOfOneCandidateHasOneWinner(t *testing.T) {
 	if err != nil || revision != 1 {
 		t.Fatalf("revision=%d error=%v, want 1", revision, err)
 	}
-	active, err := storage.ListActiveMemories(ctx, tenantID, userID)
+	active, err := storage.ListServiceableMemories(ctx, tenantID, userID, fixtureTime(100))
 	if err != nil || len(active) != 1 {
 		t.Fatalf("active=%#v error=%v", active, err)
 	}
@@ -210,7 +210,7 @@ func TestPostgresStoreConcurrentSameIdentityFormsVersionChain(t *testing.T) {
 	if len(versions) != 2 || versions[0] != 1 || versions[1] != 2 {
 		t.Fatalf("versions=%v, want [1 2]", versions)
 	}
-	active, err := storage.ListActiveMemories(ctx, tenantID, userID)
+	active, err := storage.ListServiceableMemories(ctx, tenantID, userID, fixtureTime(100))
 	if err != nil || len(active) != 1 || active[0].Version != 2 {
 		t.Fatalf("active=%#v error=%v, want only version 2", active, err)
 	}
@@ -246,7 +246,7 @@ func TestPostgresStoreSurvivesPoolCloseAndReopen(t *testing.T) {
 	if err != nil || loadedCandidate.Status != domain.CandidateApproved {
 		t.Fatalf("reopened candidate=%#v error=%v", loadedCandidate, err)
 	}
-	active, err := secondStore.ListActiveMemories(ctx, tenantID, userID)
+	active, err := secondStore.ListServiceableMemories(ctx, tenantID, userID, fixtureTime(100))
 	if err != nil || len(active) != 1 || active[0].ID != expectedMemory.ID {
 		t.Fatalf("reopened active=%#v error=%v", active, err)
 	}
@@ -254,6 +254,119 @@ func TestPostgresStoreSurvivesPoolCloseAndReopen(t *testing.T) {
 	if err != nil || revision != 1 {
 		t.Fatalf("reopened revision=%d error=%v", revision, err)
 	}
+}
+
+func TestPostgresStoreExpirationPersistsFiltersReopensAndForgets(t *testing.T) {
+	ctx := context.Background()
+	databaseURL := requiredDatabaseURL(t)
+	applyMigrations(t, databaseURL)
+	tenantID, userID := uniqueScope("expiration")
+	cleanupScopes(t, databaseURL, [][2]string{{tenantID, userID}})
+
+	asOf := fixtureTime(30)
+	past := asOf.Add(-time.Microsecond)
+	boundary := asOf
+	future := asOf.Add(time.Hour)
+	type expirationFixture struct {
+		id        string
+		expiresAt *time.Time
+	}
+	fixtures := []expirationFixture{
+		{id: "no-expiration"},
+		{id: "future", expiresAt: &future},
+		{id: "boundary", expiresAt: &boundary},
+		{id: "past", expiresAt: &past},
+	}
+
+	firstStore := openStore(t, databaseURL)
+	defer firstStore.Close()
+	for index, fixture := range fixtures {
+		event := evidence(tenantID, userID, "event-expiration-"+fixture.id, fixture.id, 1+index)
+		mustAppend(t, firstStore, event)
+		value := candidate(
+			tenantID,
+			userID,
+			"candidate-expiration-"+fixture.id,
+			"expiration_"+fixture.id,
+			fixture.id,
+			[]string{event.ID},
+			5+index,
+		)
+		value.ExpiresAt = cloneOptionalTime(fixture.expiresAt)
+		mustCreateCandidate(t, firstStore, value)
+
+		loadedCandidate, err := firstStore.CandidateByID(ctx, tenantID, userID, value.ID)
+		if err != nil {
+			firstStore.Close()
+			t.Fatalf("load candidate %q expiration: %v", fixture.id, err)
+		}
+		assertOptionalTime(t, "candidate "+fixture.id, loadedCandidate.ExpiresAt, fixture.expiresAt)
+
+		reviewed, memory, err := firstStore.ReviewCandidate(ctx, approval(value, "memory-expiration-"+fixture.id, 10+index))
+		if err != nil {
+			firstStore.Close()
+			t.Fatalf("approve candidate %q: %v", fixture.id, err)
+		}
+		assertOptionalTime(t, "reviewed candidate "+fixture.id, reviewed.ExpiresAt, fixture.expiresAt)
+		if memory == nil {
+			firstStore.Close()
+			t.Fatalf("approved memory %q is nil", fixture.id)
+		}
+		assertOptionalTime(t, "approved memory "+fixture.id, memory.ExpiresAt, fixture.expiresAt)
+	}
+	firstStore.Close()
+
+	// Reapplying the embedded migrations must preserve rows using the new
+	// nullable column, just as restarting against an existing volume does.
+	applyMigrations(t, databaseURL)
+	secondStore := openStore(t, databaseURL)
+	defer secondStore.Close()
+
+	beforeExpiration, err := secondStore.ListServiceableMemories(ctx, tenantID, userID, fixtureTime(20))
+	if err != nil {
+		t.Fatalf("list before expiration after reopen: %v", err)
+	}
+	if len(beforeExpiration) != len(fixtures) {
+		t.Fatalf("memories before expiration=%d, want %d", len(beforeExpiration), len(fixtures))
+	}
+	expectedExpiration := make(map[string]*time.Time, len(fixtures))
+	for _, fixture := range fixtures {
+		expectedExpiration["memory-expiration-"+fixture.id] = fixture.expiresAt
+	}
+	for _, memory := range beforeExpiration {
+		want, exists := expectedExpiration[memory.ID]
+		if !exists {
+			t.Fatalf("unexpected memory after reopen: %q", memory.ID)
+		}
+		assertOptionalTime(t, "reopened memory "+memory.ID, memory.ExpiresAt, want)
+	}
+
+	serviceable, err := secondStore.ListServiceableMemories(ctx, tenantID, userID, asOf)
+	if err != nil {
+		t.Fatalf("list at expiration boundary: %v", err)
+	}
+	gotIDs := make([]string, len(serviceable))
+	for index := range serviceable {
+		gotIDs[index] = serviceable[index].ID
+	}
+	wantIDs := []string{"memory-expiration-no-expiration", "memory-expiration-future"}
+	if len(gotIDs) != len(wantIDs) || gotIDs[0] != wantIDs[0] || gotIDs[1] != wantIDs[1] {
+		t.Fatalf("serviceable memory ids at boundary=%v, want %v", gotIDs, wantIDs)
+	}
+	assertCardStatuses(t, databaseURL, tenantID, userID, len(fixtures), 0)
+
+	receipt, err := secondStore.ForgetUser(ctx, tenantID, userID, asOf.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("forget user with expired cards: %v", err)
+	}
+	if receipt.EvidenceDeleted != len(fixtures) || receipt.CandidatesDeleted != len(fixtures) || receipt.MemoriesDeleted != len(fixtures) {
+		t.Fatalf("expiration deletion receipt=%#v, want %d evidence/candidates/memories", receipt, len(fixtures))
+	}
+	remaining, err := secondStore.ListServiceableMemories(ctx, tenantID, userID, fixtureTime(20))
+	if err != nil || len(remaining) != 0 {
+		t.Fatalf("memories after expiration-scope deletion=%#v error=%v", remaining, err)
+	}
+	assertDeletedScopeRows(t, databaseURL, tenantID, userID, int64(len(fixtures)+1))
 }
 
 func TestPostgresStoreCreateCandidateWithMissingSourceRollsBack(t *testing.T) {
@@ -313,7 +426,7 @@ func TestPostgresStoreApprovalFailureRollsBackProjectionAndReview(t *testing.T) 
 	assertTableRowCount(t, databaseURL, "memory_cards", tenantID, userID, 1)
 	assertTableRowCount(t, databaseURL, "memory_identity_chains", tenantID, userID, 1)
 	assertCardStatuses(t, databaseURL, tenantID, userID, 1, 0)
-	active, err := storage.ListActiveMemories(ctx, tenantID, userID)
+	active, err := storage.ListServiceableMemories(ctx, tenantID, userID, fixtureTime(100))
 	if err != nil || len(active) != 1 || active[0].ID != "memory-duplicate" || active[0].Value != "one" {
 		t.Fatalf("active memory after failed supersede=%#v error=%v", active, err)
 	}
@@ -471,13 +584,13 @@ func TestPostgresStoreForgetPropagatesAndRetainsMonotonicRevision(t *testing.T) 
 	if _, err := storage.CandidateByID(ctx, tenantID, userID, first.ID); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("deleted candidate error=%v, want not found", err)
 	}
-	active, err := storage.ListActiveMemories(ctx, tenantID, userID)
+	active, err := storage.ListServiceableMemories(ctx, tenantID, userID, fixtureTime(100))
 	if err != nil || len(active) != 0 {
 		t.Fatalf("deleted active memories=%#v error=%v", active, err)
 	}
 	assertDeletedScopeRows(t, databaseURL, tenantID, userID, int64(after))
 
-	controlActive, err := storage.ListActiveMemories(ctx, controlTenantID, controlUserID)
+	controlActive, err := storage.ListServiceableMemories(ctx, controlTenantID, controlUserID, fixtureTime(100))
 	if err != nil || len(controlActive) != 1 || controlActive[0].Value != "keep" {
 		t.Fatalf("control active=%#v error=%v", controlActive, err)
 	}
@@ -524,6 +637,27 @@ func uniqueScope(label string) (string, string) {
 
 func fixtureTime(offset int) time.Time {
 	return time.Date(2026, time.August, 19, 8, 0, offset, 123456000, time.UTC)
+}
+
+func cloneOptionalTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func assertOptionalTime(t *testing.T, label string, got, want *time.Time) {
+	t.Helper()
+	if got == nil || want == nil {
+		if got != nil || want != nil {
+			t.Fatalf("%s expiration=%v, want %v", label, got, want)
+		}
+		return
+	}
+	if !got.Equal(*want) {
+		t.Fatalf("%s expiration=%s, want %s", label, got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+	}
 }
 
 func evidence(tenantID, userID, id, content string, offset int) domain.EvidenceEvent {

@@ -76,7 +76,7 @@ func TestApprovingConflictCreatesNewActiveVersion(t *testing.T) {
 	if first.Version != 1 || second.Version != 2 {
 		t.Fatalf("got versions %d and %d, want 1 and 2", first.Version, second.Version)
 	}
-	active, err := storage.ListActiveMemories(context.Background(), "tenant-a", "user-a")
+	active, err := storage.ListServiceableMemories(context.Background(), "tenant-a", "user-a", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("list active memories: %v", err)
 	}
@@ -222,6 +222,116 @@ func TestBuildContextFailsClosedOnRetrieverScopeViolation(t *testing.T) {
 	}
 }
 
+func TestMemoryExpirationUsesSingleBuildContextSnapshot(t *testing.T) {
+	asOf := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	storage := memstore.New()
+	inner, err := retrieval.NewBM25(storage)
+	if err != nil {
+		t.Fatalf("new retriever: %v", err)
+	}
+	clockCalls := 0
+	service, err := app.New(storage, inner,
+		app.WithClock(func() time.Time { clockCalls++; return asOf }),
+		app.WithIDGenerator(sequenceIDs()),
+	)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	past := asOf.Add(-time.Second)
+	equal := asOf
+	future := asOf.Add(time.Second)
+	for _, fixture := range []struct {
+		key       string
+		expiresAt *time.Time
+		want      int
+	}{
+		{key: "pastunique", expiresAt: &past, want: 0},
+		{key: "equalunique", expiresAt: &equal, want: 0},
+		{key: "futureunique", expiresAt: &future, want: 1},
+		{key: "persistentunique", want: 1},
+	} {
+		event := ingest(t, service, "tenant-a", "user-a", "session-a", fixture.key)
+		candidate, proposeErr := service.ProposeCandidate(context.Background(), app.ProposeCandidateInput{
+			TenantID: "tenant-a", UserID: "user-a", Kind: domain.MemoryKindSemantic,
+			Category: "expiration", Key: fixture.key, Value: fixture.key, SourceEventIDs: []string{event.ID},
+			Extractor: "test", ExtractorVersion: "v1", ExpiresAt: fixture.expiresAt,
+		})
+		if proposeErr != nil {
+			t.Fatalf("propose %s: %v", fixture.key, proposeErr)
+		}
+		memory := approve(t, service, "tenant-a", "user-a", candidate.ID)
+		if memory.Status != domain.MemoryActive {
+			t.Fatalf("expired memory lifecycle status = %q, want active", memory.Status)
+		}
+		before := clockCalls
+		pack := buildContext(t, service, "tenant-a", "user-a", fixture.key)
+		if len(pack.Items) != fixture.want {
+			t.Fatalf("%s context items = %d, want %d", fixture.key, len(pack.Items), fixture.want)
+		}
+		if clockCalls != before+1 || !pack.GeneratedAt.Equal(asOf) {
+			t.Fatalf("BuildContext clock calls=%d (before %d), generated_at=%s", clockCalls, before, pack.GeneratedAt)
+		}
+	}
+}
+
+func TestProposeCandidateRejectsZeroExpirationButAllowsPast(t *testing.T) {
+	service, _ := newTestService(t)
+	event := ingest(t, service, "tenant-a", "user-a", "session-a", "temporary fact")
+	zero := time.Time{}
+	base := app.ProposeCandidateInput{
+		TenantID: "tenant-a", UserID: "user-a", Kind: domain.MemoryKindSemantic,
+		Category: "temporary", Key: "fact", Value: "value", SourceEventIDs: []string{event.ID},
+		Extractor: "test", ExtractorVersion: "v1", ExpiresAt: &zero,
+	}
+	if _, err := service.ProposeCandidate(context.Background(), base); !errors.Is(err, domain.ErrInvalid) {
+		t.Fatalf("zero expires_at error = %v, want invalid", err)
+	}
+	past := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	base.ExpiresAt = &past
+	if _, err := service.ProposeCandidate(context.Background(), base); err != nil {
+		t.Fatalf("past expires_at rejected: %v", err)
+	}
+
+	subMicrosecond := time.Date(2030, 1, 1, 0, 0, 0, 123456789, time.FixedZone("fixture", 8*60*60))
+	base.ExpiresAt = &subMicrosecond
+	candidate, err := service.ProposeCandidate(context.Background(), base)
+	if err != nil {
+		t.Fatalf("sub-microsecond expires_at rejected: %v", err)
+	}
+	want := subMicrosecond.UTC().Truncate(time.Microsecond)
+	if candidate.ExpiresAt == nil || !candidate.ExpiresAt.Equal(want) || candidate.ExpiresAt.Location() != time.UTC {
+		t.Fatalf("expires_at = %v, want canonical UTC microsecond %v", candidate.ExpiresAt, want)
+	}
+}
+
+func TestBuildContextFailsClosedOnExpiredRetrieverHit(t *testing.T) {
+	asOf := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	storage := memstore.New()
+	service, err := app.New(storage, staticRetriever{hits: []domain.SearchHit{{
+		Memory: domain.MemoryCard{
+			ID: "expired-memory", TenantID: "tenant-a", UserID: "user-a", Status: domain.MemoryActive,
+			ExpiresAt: &asOf, SourceEventIDs: []string{"never-loaded"},
+		},
+	}}}, app.WithClock(func() time.Time { return asOf }))
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	_, err = service.BuildContext(context.Background(), app.BuildContextInput{
+		TenantID: "tenant-a", UserID: "user-a", Query: "expired", Limit: 5,
+	})
+	if !errors.Is(err, domain.ErrInvariant) {
+		t.Fatalf("expired retriever hit error=%v, want invariant", err)
+	}
+}
+
+func sequenceIDs() app.IDGenerator {
+	counter := 0
+	return func(prefix string) (string, error) {
+		counter++
+		return fmt.Sprintf("%s_exp_%03d", prefix, counter), nil
+	}
+}
+
 type deleteDuringSearchRetriever struct {
 	inner   app.Retriever
 	storage *memstore.Store
@@ -232,12 +342,12 @@ type staticRetriever struct {
 	hits []domain.SearchHit
 }
 
-func (retriever staticRetriever) Search(context.Context, string, string, string, int) ([]domain.SearchHit, error) {
+func (retriever staticRetriever) Search(context.Context, string, string, string, int, time.Time) ([]domain.SearchHit, error) {
 	return append([]domain.SearchHit(nil), retriever.hits...), nil
 }
 
-func (retriever *deleteDuringSearchRetriever) Search(ctx context.Context, tenantID, userID, query string, limit int) ([]domain.SearchHit, error) {
-	hits, err := retriever.inner.Search(ctx, tenantID, userID, query, limit)
+func (retriever *deleteDuringSearchRetriever) Search(ctx context.Context, tenantID, userID, query string, limit int, asOf time.Time) ([]domain.SearchHit, error) {
+	hits, err := retriever.inner.Search(ctx, tenantID, userID, query, limit, asOf)
 	if err != nil {
 		return nil, err
 	}

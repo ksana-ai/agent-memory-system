@@ -60,6 +60,7 @@ type ArmAggregateV2 struct {
 	RequireEmptyFailures      int     `json:"require_empty_failures"`
 	ScopeViolations           int     `json:"scope_violations"`
 	NonActiveHits             int     `json:"nonactive_hits"`
+	ExpiredHits               int     `json:"expired_hits"`
 	UnknownHits               int     `json:"unknown_hits"`
 	DuplicateHits             int     `json:"duplicate_hits"`
 	OverLimitHits             int     `json:"over_limit_hits"`
@@ -114,6 +115,7 @@ type QueryPolicyV2 struct {
 	RequireEmptyFailure       bool `json:"require_empty_failure"`
 	ScopeViolations           int  `json:"scope_violations"`
 	NonActiveHits             int  `json:"nonactive_hits"`
+	ExpiredHits               int  `json:"expired_hits"`
 	UnknownHits               int  `json:"unknown_hits"`
 	DuplicateHits             int  `json:"duplicate_hits"`
 	OverLimitHits             int  `json:"over_limit_hits"`
