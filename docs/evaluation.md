@@ -2,10 +2,11 @@
 
 ## Current fixtures
 
-The repository keeps two deliberately different contracts:
+The repository keeps three deliberately different contracts:
 
 - `datasets/retrieval-smoke-v1.json` is the unchanged 8-case compatibility smoke test. It uses flat, pre-approved fixtures and scores memory keys.
-- `datasets/memory-lifecycle-v2.json` is the current deterministic acceptance benchmark. It contains 30 cases and executes ordered, explicitly timed application operations across multiple sessions and tenant/user scopes.
+- `datasets/memory-lifecycle-v2.json` is the original deterministic development/regression benchmark. It contains 30 cases and executes ordered, explicitly timed application operations across multiple sessions and tenant/user scopes.
+- `datasets/memory-semantic-extension-v1.json` is a separately scored 30-case semantic extension with larger per-query corpora and authored hard negatives. It was committed prospectively before its first retrieval run; after that first look it became a known regression set. It is synthetic, not independently collected or production-representative.
 
 The v2 runner never inserts a `MemoryCard` directly. Its compact `memory.remember` fixture expands to `IngestEvidence → ProposeCandidate → ReviewCandidate`; detailed operations are also supported. Other timeline steps exercise pending and rejected candidates, same-identity supersession, `ForgetUser`, and query checkpoints. Stable opaque aliases connect judgments to runtime IDs but are never written to memory fields, evidence content, or metadata.
 
@@ -37,7 +38,7 @@ The factory probes the endpoint with a fixed public input, requires the returned
 
 The vector wrapper uses the same random physical namespaces as FTS. Cleanup calls `ForgetUser`, proves lifecycle and embedding rows are gone, and only then removes the evaluation tombstone. Concurrent projection races with supersession and erasure accept either valid serialization result and prove that no stale vector remains.
 
-The current local 30-case comparison is:
+The original 30-case lifecycle regression at freeze revision `0e32fbaa2e783f9d3e71de6940c9e3a2e59eb34a` is:
 
 | Arm | Recall@5 | MRR | nDCG@10 | Policy pass |
 | --- | ---: | ---: | ---: | ---: |
@@ -46,7 +47,18 @@ The current local 30-case comparison is:
 | `reviewed-cards-postgres-fts-v1` | 0.6667 | 0.6250 | 0.6170 | 1.0000 |
 | `reviewed-cards-postgres-vector-v1` | 1.0000 | 0.9792 | 0.9739 | 1.0000 |
 
-The PostgreSQL FTS misses are `a02`, `a04`, `b03`, `b06`, `c02`, `c04`, `d01`, and `d04`. Dense retrieval recovered all eight at Recall@5 and had no Recall@5 miss on this run. That is evidence for this fixed synthetic fixture, not a general model-quality claim: the fixture is neither held out nor production-derived. The observed dense p50/p95 was approximately `32.9/43.3 ms` for query embedding plus exact database search on one local machine; it is not an SLA, concurrency result, or capacity estimate.
+The PostgreSQL FTS misses are `a02`, `a04`, `b03`, `b06`, `c02`, `c04`, `d01`, and `d04`. Dense retrieval recovered all eight at Recall@5 and had no Recall@5 miss on this run. The observed dense p50/p95 was approximately `34.2/42.5 ms` for query embedding plus exact database search on one local machine.
+
+The separately scored semantic extension first look produced:
+
+| Arm | Recall@5 | MRR | nDCG@10 | Policy pass |
+| --- | ---: | ---: | ---: | ---: |
+| `no-memory-v1` | 0.0000 | 0.0000 | 0.0000 | 1.0000 |
+| `reviewed-cards-bm25-v1` | 0.8333 | 0.7115 | 0.6158 | 1.0000 |
+| `reviewed-cards-postgres-fts-v1` | 0.5208 | 0.4428 | 0.3894 | 1.0000 |
+| `reviewed-cards-postgres-vector-v1` | 1.0000 | 0.9479 | 0.8912 | 1.0000 |
+
+Its dense Recall@5 interval is `[1, 1]` with `boundary_degenerate=true`; that is a finite authored-set result, not zero population uncertainty. Full provenance, marginal 95% intervals, latency smoke values, cleanup observations, and every bad case/top-five ranking are recorded in [the semantic v1 result report](evaluation-semantic-v1-results.md). The two datasets are not pooled into one quality score because many original scopes have five or fewer serviceable cards. Neither result is a general model-quality claim or a production promotion decision.
 
 ## Quality metrics
 
@@ -84,6 +96,8 @@ A v2 manifest records:
 - pre/post runtime Git inspections, their stability, whether the clean gate was required, and whether it was verified;
 - whether the policy gate was required and whether every selected arm passed it.
 
+Runner v2.1 also records marginal query-level percentile-bootstrap intervals for Recall@K, MRR, nDCG@K, and pass rate. The current fixed algorithm uses 10,000 SplitMix64 resamples and a frozen seed. Its intervals are unpaired and unstratified, so they do not support a significance claim between arms. A boundary-degenerate all-zero or all-one interval describes only the finite authored query set.
+
 `--require-clean` succeeds only when build metadata includes both a revision and a valid modified flag, runtime Git inspection succeeds, the revisions match, and both states are clean. The CLI repeats that inspection after evaluation and requires the pre/post states to match before it writes the manifest. A normal dirty-tree run remains useful for development but is ephemeral evidence. Output files are written through a same-directory temporary file and atomic rename.
 
 Run the compatibility smoke test, the v2 policy gate, or a retained clean-revision run with:
@@ -96,19 +110,21 @@ make eval-postgres
 make eval-postgres-recorded
 make eval-vector
 make eval-vector-recorded
+make eval-semantic
+make eval-semantic-recorded
 ```
 
-`make verify` includes `eval-v2`; it gates policy invariants but does not enforce a latency threshold. `make verify-postgres` separately runs the real PostgreSQL transaction/process/FTS tests and the three-arm policy gate. `make verify-vector` is intentionally separate: it requires both Docker PostgreSQL and the configured live LM Studio endpoint, runs embedding/store/evaluator race integration tests, then runs all four arms. Each recorded target performs three measured searches per query and fails unless the checkout and binary prove a matching clean revision.
+`make verify` includes `eval-v2`; it gates policy invariants but does not enforce a latency threshold. `make verify-postgres` separately runs the real PostgreSQL transaction/process/FTS tests and the three-arm policy gate. `make verify-vector` is intentionally separate: it requires both Docker PostgreSQL and the configured live LM Studio endpoint, runs embedding/store/evaluator race integration tests, then runs all four arms on the original dataset. `make verify-semantic` applies the same component gate to the semantic extension. Each recorded target performs three measured searches per query and fails unless the checkout and binary prove a matching clean revision.
 
 ## Evidence levels and boundaries
 
 1. **Static contract:** code, strict fixtures, migrations, and tests exist.
 2. **Local deterministic run:** an in-memory arm ran against a versioned dataset and emitted a manifest.
 3. **Real component run:** an external component ran with pinned configuration, such as the Docker PostgreSQL transaction suite and PostgreSQL FTS arm.
-4. **Controlled benchmark:** independently switchable arms ran on the same held-out multi-session dataset with uncertainty, latency, cost, and bad-case analysis.
+4. **Controlled benchmark:** independently switchable arms ran on the same independently held-out multi-session dataset with uncertainty, latency, cost, and bad-case analysis.
 5. **Production evidence:** privacy-safe deployed traffic metrics with explicit sampling and operational boundaries.
 
-The deterministic in-memory comparison is level 2. Selecting `reviewed-cards-postgres-fts-v1` adds level-3 PostgreSQL FTS evidence; selecting `reviewed-cards-postgres-vector-v1` adds level-3 LM Studio and pgvector evidence. Both still retrieve pre-authored, explicitly approved memory cards. They do not evaluate LLM extraction, evidence verification by a model, long-conversation chunking, reranking, answer generation, token cost, concurrent load, or production traffic.
+The deterministic in-memory comparison is level 2. Selecting `reviewed-cards-postgres-fts-v1` adds level-3 PostgreSQL FTS evidence; selecting `reviewed-cards-postgres-vector-v1` adds level-3 LM Studio and pgvector evidence. The preregistered semantic extension adds a synthetic first-look comparison, marginal uncertainty, latency smoke observations, and bad-case analysis, but it is not independently held out and therefore does not by itself satisfy level 4. Both real-component arms still retrieve pre-authored, explicitly approved memory cards. They do not evaluate LLM extraction, evidence verification by a model, long-conversation chunking, reranking, answer generation, token cost, concurrent load, or production traffic.
 
 `make verify-postgres` is level-3 component evidence for migrations, transactions, FTS, restart recovery, and deletion propagation. `make verify-vector` adds real pgvector retrieval and live embedding-endpoint evidence, but the synchronous evaluator projection is not a production indexing pipeline and the server still uses FTS.
 
@@ -120,4 +136,6 @@ The current gate runs the same memory-card judgments through:
 no memory → Go BM25 → PostgreSQL FTS → LM Studio bge-m3/pgvector
 ```
 
-All four arms now retain independent descriptors and configuration hashes. The next gate is a larger held-out dataset with uncertainty reporting, followed by a separately identified hybrid/RRF arm only if its measured bad cases justify the added complexity. ANN indexing needs its own scale and filtered-recall benchmark. Raw-conversation and dual-layer evidence retrieval require a separate judgment profile and are not current capabilities.
+All four arms retain independent descriptors and configuration hashes. The two clean manifests at revision `0e32fbaa2e783f9d3e71de6940c9e3a2e59eb34a` jointly cover 60 synthetic cases for the zero-tolerance policy gate, while quality remains separate by dataset. The semantic extension is now a regression set; its bad cases cannot be reused as a fresh holdout.
+
+The next quality gate requires an independently held-out or production-derived, privacy-safe dataset plus a preregistered paired arm-difference analysis and explicit business thresholds. A separately identified hybrid/RRF arm is justified only if evidence outside the now-known regression cases warrants the added complexity. ANN indexing needs its own scale and filtered-recall benchmark. Raw-conversation and dual-layer evidence retrieval require a separate judgment profile and are not current capabilities. The server remains on PostgreSQL FTS until a separate implementation, acceptance, and migration stage explicitly changes it.
