@@ -1,0 +1,329 @@
+openapi: 3.1.0
+info:
+  title: Go Agent Memory System API
+  version: 0.1.0
+  description: >-
+    Phase 0 local API. X-Tenant-ID and X-User-ID select a scope but are not
+    authentication credentials. Request bodies are capped at 65536 bytes;
+    x-max-bytes documents UTF-8 byte limits enforced by the server.
+servers:
+  - url: http://localhost:8080
+paths:
+  /healthz:
+    get:
+      operationId: health
+      responses:
+        "200":
+          description: Process health
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, phase, storage]
+                properties:
+                  status: {type: string}
+                  phase: {type: string}
+                  storage: {type: string}
+  /v1/evidence:
+    post:
+      operationId: appendEvidence
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/UserID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AppendEvidenceRequest"
+      responses:
+        "201":
+          description: Evidence appended
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EvidenceEvent"
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/memory-candidates:
+    post:
+      operationId: proposeMemoryCandidate
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/UserID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProposeCandidateRequest"
+      responses:
+        "201":
+          description: Pending candidate created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MemoryCandidate"
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/memory-candidates/{candidate_id}/reviews:
+    post:
+      operationId: reviewMemoryCandidate
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/UserID"
+        - name: candidate_id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReviewCandidateRequest"
+      responses:
+        "200":
+          description: Candidate reviewed; memory is present only after approval
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReviewCandidateResponse"
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/context-packs:
+    post:
+      operationId: buildContextPack
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/UserID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BuildContextRequest"
+      responses:
+        "200":
+          description: Ranked active memories with source evidence
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContextPack"
+        "400": {$ref: "#/components/responses/BadRequest"}
+  /v1/users/{user_id}:
+    delete:
+      operationId: forgetUser
+      description: Removes current in-memory evidence, candidates, and cards for one tenant/user scope.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - name: user_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Deletion receipt
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeletionReceipt"
+        "400": {$ref: "#/components/responses/BadRequest"}
+components:
+  parameters:
+    TenantID:
+      name: X-Tenant-ID
+      in: header
+      required: true
+      schema: {type: string, x-max-bytes: 128}
+    UserID:
+      name: X-User-ID
+      in: header
+      required: true
+      schema: {type: string, x-max-bytes: 128}
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    NotFound:
+      description: Resource not found in the caller scope
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    Conflict:
+      description: Duplicate identifier or invalid lifecycle transition
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+  schemas:
+    AppendEvidenceRequest:
+      type: object
+      additionalProperties: false
+      required: [session_id, actor, content]
+      properties:
+        event_id: {type: string, x-max-bytes: 128}
+        session_id: {type: string, x-max-bytes: 128}
+        actor: {type: string, enum: [user, agent, tool]}
+        content: {type: string, x-max-bytes: 32768}
+        metadata:
+          type: object
+          additionalProperties: {type: string, x-max-bytes: 1024}
+          maxProperties: 32
+        occurred_at: {type: string, format: date-time}
+    ProposeCandidateRequest:
+      type: object
+      additionalProperties: false
+      required: [kind, category, key, value, source_event_ids, extractor, extractor_version]
+      properties:
+        kind: {type: string, enum: [episodic, semantic, procedural]}
+        category: {type: string, x-max-bytes: 128}
+        key: {type: string, x-max-bytes: 128}
+        value: {type: string, x-max-bytes: 4096}
+        person: {type: string, x-max-bytes: 256}
+        relationship: {type: string, x-max-bytes: 256}
+        backstory: {type: string, x-max-bytes: 2048}
+        source_event_ids:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items: {type: string}
+        extractor: {type: string, x-max-bytes: 128}
+        extractor_version: {type: string, x-max-bytes: 128}
+        metadata:
+          type: object
+          additionalProperties: {type: string, x-max-bytes: 1024}
+          maxProperties: 32
+    ReviewCandidateRequest:
+      type: object
+      additionalProperties: false
+      required: [decision, reviewer_id, reason]
+      properties:
+        decision: {type: string, enum: [approve, reject]}
+        reviewer_id: {type: string, x-max-bytes: 128}
+        reason: {type: string, x-max-bytes: 2048}
+    BuildContextRequest:
+      type: object
+      additionalProperties: false
+      required: [query]
+      properties:
+        query: {type: string, x-max-bytes: 4096}
+        limit: {type: integer, minimum: 1, maximum: 20, default: 5}
+    EvidenceEvent:
+      type: object
+      required: [id, tenant_id, user_id, session_id, actor, content, occurred_at, recorded_at]
+      properties:
+        id: {type: string}
+        tenant_id: {type: string}
+        user_id: {type: string}
+        session_id: {type: string}
+        actor: {type: string, enum: [user, agent, tool]}
+        content: {type: string}
+        metadata:
+          type: object
+          additionalProperties: {type: string}
+        occurred_at: {type: string, format: date-time}
+        recorded_at: {type: string, format: date-time}
+    CandidateReview:
+      type: object
+      required: [decision, reviewer_id, reason, reviewed_at]
+      properties:
+        decision: {type: string, enum: [approve, reject]}
+        reviewer_id: {type: string}
+        reason: {type: string}
+        reviewed_at: {type: string, format: date-time}
+    MemoryCandidate:
+      type: object
+      required: [id, tenant_id, user_id, kind, category, key, value, source_event_ids, extractor, extractor_version, status, created_at]
+      properties:
+        id: {type: string}
+        tenant_id: {type: string}
+        user_id: {type: string}
+        kind: {type: string, enum: [episodic, semantic, procedural]}
+        category: {type: string}
+        key: {type: string}
+        value: {type: string}
+        person: {type: string}
+        relationship: {type: string}
+        backstory: {type: string}
+        source_event_ids:
+          type: array
+          items: {type: string}
+        extractor: {type: string}
+        extractor_version: {type: string}
+        status: {type: string, enum: [pending, approved, rejected]}
+        review: {$ref: "#/components/schemas/CandidateReview"}
+        created_at: {type: string, format: date-time}
+        metadata:
+          type: object
+          additionalProperties: {type: string}
+    MemoryCard:
+      type: object
+      required: [id, candidate_id, tenant_id, user_id, kind, category, key, value, source_event_ids, version, status, created_at]
+      properties:
+        id: {type: string}
+        candidate_id: {type: string}
+        tenant_id: {type: string}
+        user_id: {type: string}
+        kind: {type: string, enum: [episodic, semantic, procedural]}
+        category: {type: string}
+        key: {type: string}
+        value: {type: string}
+        person: {type: string}
+        relationship: {type: string}
+        backstory: {type: string}
+        source_event_ids:
+          type: array
+          items: {type: string}
+        version: {type: integer, minimum: 1}
+        status: {type: string, enum: [active, superseded]}
+        created_at: {type: string, format: date-time}
+        superseded_at: {type: string, format: date-time}
+    ReviewCandidateResponse:
+      type: object
+      required: [candidate]
+      properties:
+        candidate: {$ref: "#/components/schemas/MemoryCandidate"}
+        memory: {$ref: "#/components/schemas/MemoryCard"}
+    ContextItem:
+      type: object
+      required: [memory, score, sources]
+      properties:
+        memory: {$ref: "#/components/schemas/MemoryCard"}
+        score: {type: number}
+        sources:
+          type: array
+          items: {$ref: "#/components/schemas/EvidenceEvent"}
+    ContextPack:
+      type: object
+      required: [tenant_id, user_id, query, items, generated_at]
+      properties:
+        tenant_id: {type: string}
+        user_id: {type: string}
+        query: {type: string}
+        items:
+          type: array
+          items: {$ref: "#/components/schemas/ContextItem"}
+        generated_at: {type: string, format: date-time}
+    DeletionReceipt:
+      type: object
+      required: [tenant_id, user_id, evidence_deleted, candidates_deleted, memories_deleted, deleted_at]
+      properties:
+        tenant_id: {type: string}
+        user_id: {type: string}
+        evidence_deleted: {type: integer, minimum: 0}
+        candidates_deleted: {type: integer, minimum: 0}
+        memories_deleted: {type: integer, minimum: 0}
+        deleted_at: {type: string, format: date-time}
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: {type: string}
+            message: {type: string}

@@ -1,0 +1,254 @@
+{
+  "schema_version": "1",
+  "id": "memory-card-retrieval-smoke",
+  "version": "1.0.0",
+  "description": "Small synthetic fixture for checking the deterministic lexical retrieval pipeline. It is not a production benchmark.",
+  "cases": [
+    {
+      "id": "travel-seat-preference",
+      "query": "Which seat does the user prefer on flights?",
+      "memories": [
+        {
+          "kind": "semantic",
+          "category": "travel",
+          "key": "seat_preference",
+          "value": "window seat",
+          "person": "self",
+          "relationship": "self",
+          "backstory": "The user stated a stable flight seat preference.",
+          "evidence": "I prefer a window seat whenever I fly."
+        },
+        {
+          "kind": "semantic",
+          "category": "travel",
+          "key": "meal_preference",
+          "value": "vegetarian meal",
+          "person": "self",
+          "relationship": "self",
+          "backstory": "The user requested a special meal for flights.",
+          "evidence": "Please request a vegetarian meal for the flight."
+        },
+        {
+          "kind": "semantic",
+          "category": "travel",
+          "key": "loyalty_program",
+          "value": "United MileagePlus ending 5678",
+          "person": "self",
+          "relationship": "self",
+          "backstory": "Airline loyalty account supplied during booking.",
+          "evidence": "Use my United MileagePlus number ending in 5678."
+        }
+      ],
+      "gold_keys": ["seat_preference"]
+    },
+    {
+      "id": "coffee-preference-zh",
+      "query": "用户喝咖啡时偏好什么？",
+      "memories": [
+        {
+          "kind": "semantic",
+          "category": "饮食偏好",
+          "key": "coffee_preference",
+          "value": "无糖拿铁",
+          "person": "本人",
+          "relationship": "本人",
+          "backstory": "用户喝咖啡时的长期偏好是无糖拿铁。",
+          "evidence": "以后帮我点咖啡就选无糖拿铁。"
+        },
+        {
+          "kind": "semantic",
+          "category": "饮食偏好",
+          "key": "tea_preference",
+          "value": "茉莉花茶",
+          "person": "本人",
+          "relationship": "本人",
+          "backstory": "用户下午喝茶时的偏好。",
+          "evidence": "下午喝茶我一般选茉莉花茶。"
+        }
+      ],
+      "gold_keys": ["coffee_preference"]
+    },
+    {
+      "id": "passport-expiry",
+      "query": "When does the user's passport expire?",
+      "memories": [
+        {
+          "kind": "semantic",
+          "category": "identity_document",
+          "key": "passport_expiry",
+          "value": "2028-05-31",
+          "person": "self",
+          "relationship": "self",
+          "backstory": "Passport expiry date given for international travel planning.",
+          "evidence": "My passport expires on May 31, 2028."
+        },
+        {
+          "kind": "episodic",
+          "category": "travel",
+          "key": "tokyo_trip_date",
+          "value": "2027-03-10",
+          "person": "self",
+          "relationship": "self",
+          "backstory": "Planned departure date for a Tokyo trip.",
+          "evidence": "I am planning to leave for Tokyo on March 10, 2027."
+        }
+      ],
+      "gold_keys": ["passport_expiry"]
+    },
+    {
+      "id": "multiple-vehicles",
+      "query": "Which vehicles does the user own?",
+      "memories": [
+        {
+          "kind": "semantic",
+          "category": "vehicle",
+          "key": "vehicle_honda",
+          "value": "2019 Honda Accord",
+          "person": "self",
+          "relationship": "owner",
+          "backstory": "One of the user's vehicles discussed during maintenance booking.",
+          "evidence": "My 2019 Honda Accord needs its annual service."
+        },
+        {
+          "kind": "semantic",
+          "category": "vehicle",
+          "key": "vehicle_tesla",
+          "value": "2023 Tesla Model 3",
+          "person": "self",
+          "relationship": "owner",
+          "backstory": "Another vehicle owned by the user.",
+          "evidence": "I also own a 2023 Tesla Model 3."
+        },
+        {
+          "kind": "episodic",
+          "category": "vehicle_service",
+          "key": "vehicle_service_date",
+          "value": "Friday 09:00",
+          "person": "self",
+          "relationship": "owner",
+          "backstory": "A service appointment, not a vehicle identity.",
+          "evidence": "The service appointment is Friday at 09:00."
+        }
+      ],
+      "gold_keys": ["vehicle_honda", "vehicle_tesla"]
+    },
+    {
+      "id": "relationship-disambiguation",
+      "query": "Who is the user's father's cardiologist?",
+      "memories": [
+        {
+          "kind": "semantic",
+          "category": "health_contact",
+          "key": "father_cardiologist",
+          "value": "Dr. Zhang",
+          "person": "user's father",
+          "relationship": "cardiologist",
+          "backstory": "The doctor treating the user's father for a heart condition.",
+          "evidence": "Dr. Zhang is my father's cardiologist."
+        },
+        {
+          "kind": "semantic",
+          "category": "health_contact",
+          "key": "self_dentist",
+          "value": "Dr. Li",
+          "person": "self",
+          "relationship": "dentist",
+          "backstory": "The user's own dentist.",
+          "evidence": "Dr. Li is my dentist."
+        }
+      ],
+      "gold_keys": ["father_cardiologist"]
+    },
+    {
+      "id": "bank-account-ending",
+      "query": "What are the last four digits of the checking account?",
+      "memories": [
+        {
+          "kind": "semantic",
+          "category": "financial",
+          "key": "checking_account_ending",
+          "value": "4567",
+          "person": "self",
+          "relationship": "primary account holder",
+          "backstory": "Checking account identifier supplied for payment setup.",
+          "evidence": "My checking account ends in 4567."
+        },
+        {
+          "kind": "semantic",
+          "category": "financial",
+          "key": "savings_account_ending",
+          "value": "9988",
+          "person": "self",
+          "relationship": "primary account holder",
+          "backstory": "Savings account identifier.",
+          "evidence": "My savings account ends in 9988."
+        }
+      ],
+      "gold_keys": ["checking_account_ending"]
+    },
+    {
+      "id": "food-allergy",
+      "query": "What food restriction should be considered for a Thai restaurant?",
+      "memories": [
+        {
+          "kind": "semantic",
+          "category": "health",
+          "key": "dietary_allergy",
+          "value": "severe peanut allergy",
+          "person": "self",
+          "relationship": "self",
+          "backstory": "Food restriction relevant to restaurants, especially Thai cuisine.",
+          "evidence": "I have a severe peanut allergy."
+        },
+        {
+          "kind": "semantic",
+          "category": "food",
+          "key": "favorite_cuisine",
+          "value": "Thai food",
+          "person": "self",
+          "relationship": "self",
+          "backstory": "The user likes Thai cuisine.",
+          "evidence": "Thai food is one of my favorite cuisines."
+        }
+      ],
+      "gold_keys": ["dietary_allergy"]
+    },
+    {
+      "id": "backend-language",
+      "query": "What programming language does the user prefer for backend services?",
+      "memories": [
+        {
+          "kind": "semantic",
+          "category": "engineering_preference",
+          "key": "backend_language_preference",
+          "value": "Go",
+          "person": "self",
+          "relationship": "self",
+          "backstory": "Preferred programming language for backend services.",
+          "evidence": "For backend services, I prefer writing Go."
+        },
+        {
+          "kind": "semantic",
+          "category": "engineering_preference",
+          "key": "data_language_preference",
+          "value": "Python",
+          "person": "self",
+          "relationship": "self",
+          "backstory": "Preferred language for data analysis notebooks.",
+          "evidence": "For data analysis notebooks, I usually choose Python."
+        },
+        {
+          "kind": "semantic",
+          "category": "engineering_preference",
+          "key": "embedded_language_preference",
+          "value": "Rust",
+          "person": "self",
+          "relationship": "self",
+          "backstory": "Preferred language for embedded experiments.",
+          "evidence": "For embedded experiments, I want to use Rust."
+        }
+      ],
+      "gold_keys": ["backend_language_preference"]
+    }
+  ]
+}

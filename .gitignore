@@ -1,0 +1,6 @@
+.DS_Store
+.cache/
+.env
+artifacts/eval/*.json
+bin/
+coverage.out
