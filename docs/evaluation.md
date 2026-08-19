@@ -29,7 +29,17 @@ Every selected arm receives an isolated case runtime and replays the same timeli
 - `no-memory-v1`: returns no memories and provides an explicit ablation floor;
 - `reviewed-cards-bm25-v1`: runs the deterministic Go BM25 implementation over reviewed active, unexpired cards in the in-memory Store.
 
-The server's PostgreSQL-backed BM25 path is not exercised by these two arms. PostgreSQL FTS and pgvector must be added as independent real-component arms rather than being inferred from the installed extension.
+The optional real-component arm is `reviewed-cards-postgres-fts-v1`. It uses the same PostgreSQL Store and FTS implementation as the server. Every case receives random opaque physical tenant/user IDs; the wrapper restores logical IDs before runner validation. Cleanup calls the production erasure path, proves all content rows are gone, and only then removes the evaluation-only revision tombstone. PostgreSQL server/migration/text-config/query/rank metadata participates in the arm configuration hash, while the DSN is excluded from descriptors, manifests, and errors. The Make targets supply it through the environment rather than process arguments.
+
+The current local 30-case comparison is:
+
+| Arm | Recall@5 | MRR | nDCG@10 | Policy pass |
+| --- | ---: | ---: | ---: | ---: |
+| `no-memory-v1` | 0.0000 | 0.0000 | 0.0000 | 1.0000 |
+| `reviewed-cards-bm25-v1` | 1.0000 | 0.9792 | 0.9843 | 1.0000 |
+| `reviewed-cards-postgres-fts-v1` | 0.6667 | 0.6250 | 0.6170 | 1.0000 |
+
+The PostgreSQL FTS misses are `a02`, `a04`, `b03`, `b06`, `c02`, `c04`, `d01`, and `d04`. They remain visible as the baseline for the dense arm. This fixed synthetic fixture is not a held-out or production-quality benchmark, and its local latency is not an SLA.
 
 ## Quality metrics
 
@@ -75,28 +85,30 @@ Run the compatibility smoke test, the v2 policy gate, or a retained clean-revisi
 make eval
 make eval-v2
 make eval-recorded
+make eval-postgres
+make eval-postgres-recorded
 ```
 
-`make verify` includes `eval-v2`; it gates policy invariants but does not enforce a latency threshold. `make eval-recorded` performs three measured searches per query and fails unless the checkout and binary prove a matching clean revision.
+`make verify` includes `eval-v2`; it gates policy invariants but does not enforce a latency threshold. `make verify-postgres` separately runs the real PostgreSQL transaction/process/FTS tests and the three-arm policy gate. Each recorded target performs three measured searches per query and fails unless the checkout and binary prove a matching clean revision.
 
 ## Evidence levels and boundaries
 
 1. **Static contract:** code, strict fixtures, migrations, and tests exist.
 2. **Local deterministic run:** an in-memory arm ran against a versioned dataset and emitted a manifest.
-3. **Real component run:** an external component ran with pinned configuration, such as the Docker PostgreSQL transaction suite or a future PostgreSQL retrieval arm.
+3. **Real component run:** an external component ran with pinned configuration, such as the Docker PostgreSQL transaction suite and PostgreSQL FTS arm.
 4. **Controlled benchmark:** independently switchable arms ran on the same held-out multi-session dataset with uncertainty, latency, cost, and bad-case analysis.
 5. **Production evidence:** privacy-safe deployed traffic metrics with explicit sampling and operational boundaries.
 
-The current v2 benchmark remains level 2. It evaluates retrieval over pre-authored, explicitly approved memory cards. It does not evaluate LLM extraction, evidence verification by a model, long-conversation chunking, embeddings, reranking, answer generation, token cost, concurrent load, or production traffic.
+The deterministic in-memory comparison is level 2; selecting `reviewed-cards-postgres-fts-v1` adds level-3 local component evidence. It still evaluates retrieval over pre-authored, explicitly approved memory cards. It does not evaluate LLM extraction, evidence verification by a model, long-conversation chunking, embeddings, reranking, answer generation, token cost, concurrent load, or production traffic.
 
-`make verify-postgres` is separate level-3 component evidence for migrations, transactions, restart recovery, and deletion propagation. It is not pgvector retrieval evidence merely because the Docker image installs the extension.
+`make verify-postgres` is level-3 component evidence for migrations, transactions, FTS, restart recovery, and deletion propagation. It is not pgvector retrieval evidence merely because the Docker image installs the extension.
 
 ## Next comparison
 
 The next phase runs the same memory-card judgments through:
 
 ```text
-no memory → Go BM25 → PostgreSQL FTS → bge-m3/pgvector
+no memory → Go BM25 → PostgreSQL FTS → LM Studio bge-m3/pgvector
 ```
 
 Lexical, dense, and later hybrid results must retain independent descriptors and configuration hashes. Reciprocal-rank fusion or reranking is added only if the measured bad cases justify it. Raw-conversation and dual-layer evidence retrieval require a separate judgment profile and are not current capabilities.

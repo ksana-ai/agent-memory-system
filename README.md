@@ -2,7 +2,7 @@
 
 A Go-native, evidence-first memory service for agents. It separates raw conversation evidence, untrusted memory proposals, reviewed/versioned memory cards, and the Context Pack assembled for one request.
 
-> **Current status: durable PostgreSQL vertical slice plus deterministic retrieval gate.** The server binary uses PostgreSQL started by Docker Compose, applies embedded transactional migrations, and has real-process restart and deletion-propagation tests. Retrieval is still deterministic BM25 over active, unexpired PostgreSQL cards. A 30-case lifecycle benchmark compares no-memory and reviewed-card BM25 arms. The pgvector extension is installed for the next retrieval phase, but embeddings and vector search are not implemented.
+> **Current status: durable PostgreSQL vertical slice with real full-text retrieval.** The server binary uses PostgreSQL started by Docker Compose, applies embedded transactional migrations, and searches active, unexpired cards through a generated `tsvector` and partial GIN index. Real-process restart and deletion-propagation tests cover that runtime path. A 30-case lifecycle benchmark compares no-memory, deterministic Go BM25, and PostgreSQL FTS arms. The pgvector extension is installed for the next phase, but embeddings and vector search are not implemented.
 
 ## Why this project exists
 
@@ -14,7 +14,7 @@ flowchart LR
     C --> R{Explicit review}
     R -->|reject| X[Not serviceable]
     R -->|approve| M[Versioned memory card]
-    M --> S[Scoped BM25 retrieval]
+    M --> S[Scoped PostgreSQL FTS]
     E --> P[Context Pack with sources]
     S --> P
 ```
@@ -36,9 +36,9 @@ The implemented invariants are:
 | Transactional conflict versioning | Concurrent approvals produce v1/v2 with one active card; failure-in-the-middle rolls back | Last-approved-wins, not semantic conflict resolution |
 | Tenant/user isolation | Composite database constraints plus cross-scope tests | Scope headers are selectors, not proof of identity |
 | Restart recovery | Test starts, SIGTERMs, and restarts the actual server binary against one Docker volume | No backup/restore drill yet |
-| Deletion propagation | DELETE commits, BM25 returns nothing, a third server process still sees nothing, and database tables are inspected | Covers PostgreSQL and the live BM25 path; there is no external vector index or backup deletion policy |
+| Deletion propagation | DELETE commits, PostgreSQL FTS returns nothing, a third server process still sees nothing, and database tables are inspected | The generated search document is deleted with its card row; there is no external vector index or backup deletion policy |
 | Time-based serviceability | Optional absolute `expires_at` is copied from candidate to card; equality is expired and is checked in storage, retrieval, and Context Pack assembly | Expiration does not delete data or change the card's lifecycle status |
-| Offline evaluation | Legacy 8-case smoke fixture plus a strict 30-case lifecycle dataset; multi-arm manifests report Recall@K, MRR, nDCG, policy failures, source invariants, and smoke timing | Uses authored cards and the in-memory adapter; it does not measure extraction, PostgreSQL retrieval, embeddings, load, or production traffic |
+| Offline evaluation | Legacy 8-case smoke fixture plus a strict 30-case lifecycle dataset; multi-arm manifests compare no-memory, Go BM25, and real PostgreSQL FTS while reporting Recall@K, MRR, nDCG, policy failures, source invariants, and smoke timing | Uses authored cards and synthetic queries; it does not measure extraction, embeddings, load, or production traffic |
 | pgvector | Docker image and migration create extension `vector` | No vector column, embedding model, ANN index, or vector query yet |
 
 The in-memory adapter remains only for fast unit tests and deterministic offline evaluation. `cmd/server` has no in-memory fallback and fails fast when PostgreSQL is unavailable.
@@ -80,7 +80,7 @@ make db-down
 
 Docker Compose uses `pgvector/pgvector:0.8.6-pg18-bookworm`, binds PostgreSQL only to `127.0.0.1:55432`, and stores data in `go-agent-memory-system_postgres-data`. Running `docker compose down --volumes` permanently deletes that development volume.
 
-The default development credentials are listed in `.env.example`. Make does not load `.env`; pass overrides through the shell or on the Make command line. It exports `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_PORT` to Compose and derives the default DSN without printing it. A complete `DATABASE_URL`/`TEST_DATABASE_URL` can also be supplied. Changing initialization credentials does not rewrite an existing PostgreSQL volume; recreating that disposable development volume is a separate, destructive operation.
+The default development credentials are listed in `.env.example`. Make does not load `.env`; pass overrides through the shell or on the Make command line. It exports `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_PORT` to Compose and derives the default DSN without printing it. A complete `DATABASE_URL`/`TEST_DATABASE_URL` can also be supplied. The binaries intentionally do not accept DSN flags, keeping credentials out of their advertised process arguments. Changing initialization credentials does not rewrite an existing PostgreSQL volume; recreating that disposable development volume is a separate, destructive operation.
 
 ## Exercise the lifecycle
 
@@ -154,9 +154,10 @@ The full HTTP contract is in [`api/openapi.yaml`](api/openapi.yaml).
 
 ```bash
 make verify             # format, vet, unit tests, race tests, build
-make verify-postgres    # Docker health, migration, PG contract + process tests
+make verify-postgres    # Docker health, migrations, PG/process tests + real FTS policy gate
 make eval               # deterministic lexical smoke evaluation
 make eval-v2            # 30-case no-memory vs reviewed-card BM25 policy gate
+make eval-postgres      # same 30 cases across no-memory, Go BM25, and real PG FTS
 ```
 
 The PostgreSQL test tag is intentionally strict: invoking it directly without `TEST_DATABASE_URL`, or invoking the process test without `TEST_SERVER_BINARY`, fails instead of silently skipping.
@@ -165,11 +166,14 @@ To retain a machine-readable v2 run from a clean committed revision:
 
 ```bash
 make eval-recorded
+make eval-postgres-recorded
 ```
 
-`eval-recorded` verifies that the binary's build revision matches a clean runtime checkout before atomically writing `artifacts/eval/memory-lifecycle-v2-latest.json`. The artifact is ignored by Git by default; retaining or publishing it is a separate evidence decision.
+Both recorded targets verify that the binary's build revision matches a clean runtime checkout before atomically writing under `artifacts/eval/`. The PostgreSQL target records non-sensitive server, migration, text configuration, query-strategy, and rank-function metadata; connection details never enter the manifest, and the Make targets read the URL from the environment instead of placing it in process arguments. Artifacts are ignored by Git by default, so retaining or publishing one is a separate evidence decision.
 
-Both fixtures are synthetic. The v2 runner executes real application lifecycle calls—including approval, rejection, supersession, expiration, erasure, and cross-scope queries—but uses the in-memory Store for deterministic comparison. It therefore proves the fixture lifecycle and retrieval-policy behavior, not PostgreSQL search performance, embedding quality, LLM extraction, or production retrieval quality.
+Both fixtures are synthetic. The v2 runner executes real application lifecycle calls—including approval, rejection, supersession, expiration, erasure, and cross-scope queries. The optional PostgreSQL arm gives each case a random physical tenant/user namespace, runs the real Store and FTS query, then proves complete content and revision-state cleanup. This is local component evidence, not production search performance, embedding quality, or LLM-extraction evidence.
+
+On the current 30-case fixture, the local PostgreSQL FTS baseline reaches Recall@5 `0.6667`, MRR `0.6250`, and nDCG@10 `0.6170`, versus `1.0000`, `0.9792`, and `0.9843` for deterministic Go BM25. Both retrieval arms pass every scope, lifecycle, expiration, payload, and source-provenance policy check. The eight FTS misses are retained evidence of lexical/paraphrase and multilingual limits; they motivate the dense-retrieval phase rather than being tuned away. Local latency samples are smoke observations, not an SLA.
 
 See [`docs/architecture.md`](docs/architecture.md) for transaction boundaries and [`docs/evaluation.md`](docs/evaluation.md) for metric semantics and evidence levels.
 
@@ -186,15 +190,15 @@ internal/api/                Strict HTTP/JSON boundary
 internal/app/                Memory lifecycle application service
 internal/domain/             Evidence, candidate, card, context, deletion types
 internal/migrations/         Tern runner and versioned SQL
-internal/retrieval/          Deterministic BM25 baseline
+internal/retrieval/          Deterministic in-memory BM25 baseline
 internal/store/memstore/     Unit/evaluation test double
-internal/store/postgres/     Durable transactional adapter and contract tests
+internal/store/postgres/     Durable transactions, FTS, eval isolation, contract tests
 compose.yaml                 Local PostgreSQL/pgvector service
 ```
 
 ## Roadmap
 
-1. Add PostgreSQL full-text search and one real `text-embedding-bge-m3`/pgvector retrieval arm, then compare them on the same dataset.
+1. Add one real LM Studio `text-embedding-bge-m3`/pgvector retrieval arm and compare all four arms on the same dataset.
 2. Grow the 30-case gate toward roughly 60 held-out multi-session cases and add uncertainty reporting.
 3. Add reciprocal-rank fusion/reranking only if the measured baseline justifies it.
 4. Add authenticated principals, authorization, PII policy, rate limits, redacted observability, backup/restore, and backup-aware erasure.

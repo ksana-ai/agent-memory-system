@@ -16,9 +16,10 @@ import (
 	"github.com/kai443/go-agent-memory-system/internal/api"
 	"github.com/kai443/go-agent-memory-system/internal/app"
 	"github.com/kai443/go-agent-memory-system/internal/migrations"
-	"github.com/kai443/go-agent-memory-system/internal/retrieval"
 	"github.com/kai443/go-agent-memory-system/internal/store/postgres"
 )
+
+const serverPhase = "postgres-fts"
 
 func main() {
 	if err := run(); err != nil {
@@ -29,35 +30,31 @@ func main() {
 
 func run() error {
 	address := flag.String("addr", "127.0.0.1:8080", "HTTP listen address")
-	databaseURL := flag.String("database-url", os.Getenv("DATABASE_URL"), "PostgreSQL connection URL (defaults to DATABASE_URL)")
 	flag.Parse()
-	if strings.TrimSpace(*databaseURL) == "" {
-		return errors.New("PostgreSQL connection URL is required: set DATABASE_URL or pass -database-url")
+	databaseURL := os.Getenv("DATABASE_URL")
+	if strings.TrimSpace(databaseURL) == "" {
+		return errors.New("PostgreSQL connection URL is required: set DATABASE_URL")
 	}
 
 	startupContext, cancelStartup := context.WithTimeout(context.Background(), 30*time.Second)
-	if err := migrations.Apply(startupContext, *databaseURL); err != nil {
+	if err := migrations.Apply(startupContext, databaseURL); err != nil {
 		cancelStartup()
 		return fmt.Errorf("apply database migrations: %w", err)
 	}
-	storage, err := postgres.Open(startupContext, *databaseURL)
+	storage, err := postgres.Open(startupContext, databaseURL)
 	cancelStartup()
 	if err != nil {
 		return fmt.Errorf("open PostgreSQL store: %w", err)
 	}
 	defer storage.Close()
 
-	retriever, err := retrieval.NewBM25(storage)
-	if err != nil {
-		return fmt.Errorf("create retriever: %w", err)
-	}
-	service, err := app.New(storage, retriever)
+	service, err := app.New(storage, storage)
 	if err != nil {
 		return fmt.Errorf("create service: %w", err)
 	}
 	handler, err := api.NewHandler(
 		service,
-		api.WithPhase("durable-storage"),
+		api.WithPhase(serverPhase),
 		api.WithStorage("postgresql"),
 		api.WithReadiness(storage),
 	)
@@ -76,7 +73,7 @@ func run() error {
 	shutdownContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	slog.Info("starting HTTP server", "address", *address, "storage", "postgresql")
+	slog.Info("starting HTTP server", "address", *address, "storage", "postgresql", "retrieval", serverPhase)
 	serverError := make(chan error, 1)
 	go func() {
 		serverError <- server.ListenAndServe()

@@ -4,24 +4,74 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"flag"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 func TestSelectArmFactoriesSortsAndRejectsInvalidIDs(t *testing.T) {
-	factories, err := selectArmFactories("reviewed-cards-bm25-v1,no-memory-v1")
+	factories, err := selectArmFactories(context.Background(), "reviewed-cards-bm25-v1,no-memory-v1", "")
 	if err != nil {
 		t.Fatalf("select arms: %v", err)
 	}
 	if got := factories[0].Descriptor().ID; got != "no-memory-v1" {
 		t.Fatalf("first arm = %q, want no-memory-v1", got)
 	}
-	if _, err := selectArmFactories("no-memory-v1,no-memory-v1"); err == nil {
+	if _, err := selectArmFactories(context.Background(), "no-memory-v1,no-memory-v1", ""); err == nil {
 		t.Fatal("duplicate arm was accepted")
 	}
-	if _, err := selectArmFactories("unknown"); err == nil {
+	if _, err := selectArmFactories(context.Background(), "unknown", ""); err == nil {
 		t.Fatal("unknown arm was accepted")
+	}
+	if _, err := selectArmFactories(context.Background(), "reviewed-cards-postgres-fts-v1", ""); err == nil {
+		t.Fatal("PostgreSQL arm without URL was accepted")
+	}
+}
+
+func TestPostgresURLDefaultDoesNotLeakThroughFlagHelp(t *testing.T) {
+	t.Setenv("TEST_DATABASE_URL", "postgres://user:flag-help-secret@example.invalid/database")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := run(context.Background(), []string{"-help"}, &stdout, &stderr)
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("run help error = %v, want flag.ErrHelp", err)
+	}
+	if strings.Contains(stderr.String(), "flag-help-secret") {
+		t.Fatalf("flag help leaked TEST_DATABASE_URL: %q", stderr.String())
+	}
+}
+
+func TestPostgresURLFlagIsNotAccepted(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := run(context.Background(), []string{"-postgres-url=postgres://user:secret@example.invalid/database"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
+		t.Fatalf("removed PostgreSQL URL flag error = %v", err)
+	}
+	if strings.Contains(err.Error(), "secret") || strings.Contains(stderr.String(), "secret") {
+		t.Fatalf("removed PostgreSQL URL flag leaked its value: error=%q stderr=%q", err, stderr.String())
+	}
+}
+
+func TestEvalPostgresDryRunDoesNotPutDatabaseURLInCommand(t *testing.T) {
+	const secretURL = "postgres://eval-user:make-dry-run-secret@db.example.invalid/agent_memory"
+	for _, target := range []string{"eval-postgres", "eval-postgres-recorded"} {
+		command := exec.Command("make", "-n", target, "TEST_DATABASE_URL="+secretURL)
+		command.Dir = filepath.Join("..", "..")
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("make -n %s: %v\n%s", target, err, output)
+		}
+		if strings.Contains(string(output), secretURL) || strings.Contains(string(output), "make-dry-run-secret") {
+			t.Fatalf("%s command leaked TEST_DATABASE_URL: %s", target, output)
+		}
+		if strings.Contains(string(output), "-postgres-url") {
+			t.Fatalf("%s passed the database URL through argv: %s", target, output)
+		}
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"sort"
 	"time"
 
@@ -25,11 +26,12 @@ const (
 // ConfigHash prevents two materially different configurations from being
 // reported under the same arm ID and version.
 type ArmDescriptor struct {
-	ID              string `json:"id"`
-	Version         string `json:"version"`
-	JudgmentProfile string `json:"judgment_profile"`
-	ResultKind      string `json:"result_kind"`
-	ConfigHash      string `json:"config_hash"`
+	ID              string            `json:"id"`
+	Version         string            `json:"version"`
+	JudgmentProfile string            `json:"judgment_profile"`
+	ResultKind      string            `json:"result_kind"`
+	ConfigHash      string            `json:"config_hash"`
+	Metadata        map[string]string `json:"metadata,omitempty"`
 }
 
 // ArmRuntime is deliberately constructed for one case only. The runner never
@@ -52,7 +54,11 @@ type armFactory struct {
 	newRuntime func(context.Context) (ArmRuntime, error)
 }
 
-func (factory armFactory) Descriptor() ArmDescriptor { return factory.descriptor }
+func (factory armFactory) Descriptor() ArmDescriptor {
+	descriptor := factory.descriptor
+	descriptor.Metadata = maps.Clone(factory.descriptor.Metadata)
+	return descriptor
+}
 
 func (factory armFactory) NewRuntime(ctx context.Context) (ArmRuntime, error) {
 	if err := ctx.Err(); err != nil {

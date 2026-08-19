@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -367,6 +369,292 @@ func TestPostgresStoreExpirationPersistsFiltersReopensAndForgets(t *testing.T) {
 		t.Fatalf("memories after expiration-scope deletion=%#v error=%v", remaining, err)
 	}
 	assertDeletedScopeRows(t, databaseURL, tenantID, userID, int64(len(fixtures)+1))
+}
+
+func TestPostgresFTSSchemaAndMetadata(t *testing.T) {
+	ctx := context.Background()
+	databaseURL := requiredDatabaseURL(t)
+	applyMigrations(t, databaseURL)
+	applyMigrations(t, databaseURL)
+	storage := openStore(t, databaseURL)
+	defer storage.Close()
+
+	metadata, err := storage.FTSMetadata(ctx)
+	if err != nil {
+		t.Fatalf("load FTS metadata: %v", err)
+	}
+	serverVersion, err := strconv.Atoi(metadata.ServerVersionNum)
+	if err != nil || serverVersion <= 0 {
+		t.Fatalf("server_version_num=%q error=%v, want positive integer", metadata.ServerVersionNum, err)
+	}
+	if metadata.SchemaMigrationVersion < 3 {
+		t.Fatalf("schema migration version=%d, want at least 3", metadata.SchemaMigrationVersion)
+	}
+	if metadata.TextSearchConfig != postgres.FTSTextSearchConfig ||
+		metadata.QueryStrategy != postgres.FTSQueryStrategy ||
+		metadata.RankFunction != postgres.FTSRankFunction {
+		t.Fatalf("unexpected FTS metadata: %#v", metadata)
+	}
+
+	conn, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect to inspect FTS schema: %v", err)
+	}
+	defer conn.Close(context.Background())
+	var generated, expression string
+	if err := conn.QueryRow(ctx, `
+		SELECT is_generated, generation_expression
+		FROM information_schema.columns
+		WHERE table_schema = 'agent_memory'
+		  AND table_name = 'memory_cards'
+		  AND column_name = 'search_document'
+	`).Scan(&generated, &expression); err != nil {
+		t.Fatalf("inspect generated search document: %v", err)
+	}
+	lowerExpression := strings.ToLower(expression)
+	if generated != "ALWAYS" ||
+		!strings.Contains(lowerExpression, "to_tsvector") ||
+		!strings.Contains(lowerExpression, "simple") ||
+		!strings.Contains(lowerExpression, "setweight") {
+		t.Fatalf("search_document generated=%q expression=%q", generated, expression)
+	}
+	for _, field := range []string{"memory_key", "value", "category", "person", "relationship", "backstory"} {
+		if !strings.Contains(lowerExpression, field) {
+			t.Fatalf("search_document expression omits %s: %q", field, expression)
+		}
+	}
+
+	var indexDefinition string
+	if err := conn.QueryRow(ctx, `
+		SELECT indexdef
+		FROM pg_indexes
+		WHERE schemaname = 'agent_memory'
+		  AND tablename = 'memory_cards'
+		  AND indexname = 'memory_cards_active_search_document_gin_idx'
+	`).Scan(&indexDefinition); err != nil {
+		t.Fatalf("inspect FTS index: %v", err)
+	}
+	lowerIndex := strings.ToLower(indexDefinition)
+	if !strings.Contains(lowerIndex, "using gin") ||
+		!strings.Contains(lowerIndex, "search_document") ||
+		!strings.Contains(lowerIndex, "where") ||
+		!strings.Contains(lowerIndex, "status") ||
+		!strings.Contains(lowerIndex, "active") {
+		t.Fatalf("unexpected FTS index definition: %q", indexDefinition)
+	}
+}
+
+func TestPostgresFTSSearchRanksFiltersDeterministicallyAndForgets(t *testing.T) {
+	ctx := context.Background()
+	databaseURL := requiredDatabaseURL(t)
+	applyMigrations(t, databaseURL)
+	tenantID, userID := uniqueScope("fts")
+	otherTenantID, _ := uniqueScope("fts_other_tenant")
+	_, otherUserID := uniqueScope("fts_other_user")
+	cleanupScopes(t, databaseURL, [][2]string{
+		{tenantID, userID},
+		{otherTenantID, userID},
+		{tenantID, otherUserID},
+	})
+	storage := openStore(t, databaseURL)
+	defer storage.Close()
+
+	asOf := fixtureTime(100)
+	past := asOf.Add(-time.Microsecond)
+	equal := asOf
+	future := asOf.Add(time.Hour)
+	const rankTerm = "quartzmarker"
+
+	seedOne := func(scopeTenant, scopeUser, id, key, value string, eventOffset, reviewOffset int, configure func(*domain.MemoryCandidate)) domain.MemoryCard {
+		t.Helper()
+		event := evidence(scopeTenant, scopeUser, "event-"+id, "source "+id, eventOffset)
+		mustAppend(t, storage, event)
+		candidate := candidate(scopeTenant, scopeUser, "candidate-"+id, key, value, []string{event.ID}, eventOffset+1)
+		if configure != nil {
+			configure(&candidate)
+		}
+		mustCreateCandidate(t, storage, candidate)
+		_, memory, err := storage.ReviewCandidate(ctx, approval(candidate, "memory-"+id, reviewOffset))
+		if err != nil {
+			t.Fatalf("approve FTS fixture %q: %v", id, err)
+		}
+		if memory == nil {
+			t.Fatalf("approved FTS fixture %q has nil memory", id)
+		}
+		return *memory
+	}
+
+	firstSource := evidence(tenantID, userID, "event-rank-key-first", "first ordered source", 1)
+	secondSource := evidence(tenantID, userID, "event-rank-key-second", "second ordered source", 2)
+	mustAppend(t, storage, firstSource)
+	mustAppend(t, storage, secondSource)
+	keyCandidate := candidate(
+		tenantID,
+		userID,
+		"candidate-rank-key",
+		rankTerm,
+		"key-weight match",
+		[]string{secondSource.ID, firstSource.ID},
+		3,
+	)
+	mustCreateCandidate(t, storage, keyCandidate)
+	_, keyMemory, err := storage.ReviewCandidate(ctx, approval(keyCandidate, "memory-rank-key", 4))
+	if err != nil || keyMemory == nil {
+		t.Fatalf("approve key-rank fixture memory=%#v error=%v", keyMemory, err)
+	}
+
+	seedOne(tenantID, userID, "rank-value", "value_match", rankTerm, 5, 7, func(candidate *domain.MemoryCandidate) {
+		candidate.ExpiresAt = &future
+	})
+	seedOne(tenantID, userID, "rank-category", "category_match", "category body", 8, 10, func(candidate *domain.MemoryCandidate) {
+		candidate.Category = rankTerm
+	})
+	seedOne(tenantID, userID, "rank-backstory", "backstory_match", "backstory body", 11, 13, func(candidate *domain.MemoryCandidate) {
+		candidate.Backstory = rankTerm
+	})
+	seedOne(tenantID, userID, "expired-past", "expired_past", rankTerm, 14, 16, func(candidate *domain.MemoryCandidate) {
+		candidate.ExpiresAt = &past
+	})
+	seedOne(tenantID, userID, "expired-equal", "expired_equal", rankTerm, 17, 19, func(candidate *domain.MemoryCandidate) {
+		candidate.ExpiresAt = &equal
+	})
+	seedOne(tenantID, userID, "version-old", "versioned_identity", rankTerm, 20, 22, nil)
+	seedOne(tenantID, userID, "version-new", "versioned_identity", "replacement without search term", 23, 25, nil)
+	seedOne(tenantID, userID, "tie-b", "tie_b", "tielexeme", 30, 40, nil)
+	seedOne(tenantID, userID, "tie-a", "tie_a", "tielexeme", 31, 40, nil)
+	seedOne(tenantID, userID, "or-alpha", "or_alpha", "alpha", 42, 44, nil)
+	seedOne(tenantID, userID, "or-beta", "or_beta", "beta", 45, 47, nil)
+	seedOne(otherTenantID, userID, "foreign-tenant", rankTerm, rankTerm, 50, 52, nil)
+	seedOne(tenantID, otherUserID, "foreign-user", rankTerm, rankTerm, 53, 55, nil)
+
+	rankHits, err := storage.Search(ctx, tenantID, userID, rankTerm, 20, asOf)
+	if err != nil {
+		t.Fatalf("rank FTS results: %v", err)
+	}
+	wantRankIDs := []string{"memory-rank-key", "memory-rank-value", "memory-rank-category", "memory-rank-backstory"}
+	if len(rankHits) != len(wantRankIDs) {
+		t.Fatalf("rank hit count=%d, want %d: %#v", len(rankHits), len(wantRankIDs), rankHits)
+	}
+	for index, wantID := range wantRankIDs {
+		if rankHits[index].Memory.ID != wantID {
+			t.Fatalf("rank hit %d id=%q, want %q: %#v", index, rankHits[index].Memory.ID, wantID, rankHits)
+		}
+		if index > 0 && rankHits[index-1].Score <= rankHits[index].Score {
+			t.Fatalf("rank scores are not strictly descending: %#v", rankHits)
+		}
+	}
+	if got := rankHits[0].Memory.SourceEventIDs; len(got) != 2 || got[0] != secondSource.ID || got[1] != firstSource.ID {
+		t.Fatalf("FTS source order=%v, want [%s %s]", got, secondSource.ID, firstSource.ID)
+	}
+	limitedHits, err := storage.Search(ctx, tenantID, userID, rankTerm, 2, asOf)
+	if err != nil || len(limitedHits) != 2 || limitedHits[0].Memory.ID != wantRankIDs[0] || limitedHits[1].Memory.ID != wantRankIDs[1] {
+		t.Fatalf("limited rank hits=%#v error=%v", limitedHits, err)
+	}
+
+	unsafeLookingQuery := rankTerm + " | !:* '); DROP TABLE agent_memory.memory_cards; --"
+	unsafeHits, err := storage.Search(ctx, tenantID, userID, unsafeLookingQuery, 20, asOf)
+	if err != nil || len(unsafeHits) < len(wantRankIDs) || unsafeHits[0].Memory.ID != wantRankIDs[0] {
+		t.Fatalf("plain-text query syntax isolation hits=%#v error=%v", unsafeHits, err)
+	}
+
+	orHits, err := storage.Search(ctx, tenantID, userID, "alpha beta", 20, asOf)
+	if err != nil {
+		t.Fatalf("OR search: %v", err)
+	}
+	if len(orHits) != 2 || orHits[0].Memory.ID != "memory-or-beta" || orHits[1].Memory.ID != "memory-or-alpha" {
+		t.Fatalf("OR hits=%#v, want both alpha and beta ordered by recency", orHits)
+	}
+
+	for attempt := 0; attempt < 10; attempt++ {
+		tieHits, err := storage.Search(ctx, tenantID, userID, "tielexeme", 20, asOf)
+		if err != nil {
+			t.Fatalf("tie search attempt %d: %v", attempt, err)
+		}
+		if len(tieHits) != 2 || tieHits[0].Memory.ID != "memory-tie-a" || tieHits[1].Memory.ID != "memory-tie-b" {
+			t.Fatalf("tie search attempt %d hits=%#v", attempt, tieHits)
+		}
+		if tieHits[0].Score != tieHits[1].Score {
+			t.Fatalf("tie scores differ: %#v", tieHits)
+		}
+	}
+	for _, input := range []struct {
+		query string
+		limit int
+	}{
+		{query: "", limit: 20},
+		{query: "   ", limit: 20},
+		{query: "!!!", limit: 20},
+		{query: rankTerm, limit: 0},
+		{query: rankTerm, limit: -1},
+	} {
+		hits, err := storage.Search(ctx, tenantID, userID, input.query, input.limit, asOf)
+		if err != nil || len(hits) != 0 {
+			t.Fatalf("empty search contract query=%q limit=%d hits=%#v error=%v", input.query, input.limit, hits, err)
+		}
+	}
+
+	receipt, err := storage.ForgetUser(ctx, tenantID, userID, asOf.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("forget FTS scope: %v", err)
+	}
+	if receipt.EvidenceDeleted != 13 || receipt.CandidatesDeleted != 12 || receipt.MemoriesDeleted != 12 {
+		t.Fatalf("FTS deletion receipt=%#v, want evidence/candidates/memories 13/12/12", receipt)
+	}
+	afterForget, err := storage.Search(ctx, tenantID, userID, rankTerm, 20, asOf)
+	if err != nil || len(afterForget) != 0 {
+		t.Fatalf("FTS results after forget=%#v error=%v", afterForget, err)
+	}
+	foreignHits, err := storage.Search(ctx, otherTenantID, userID, rankTerm, 20, asOf)
+	if err != nil || len(foreignHits) != 1 || foreignHits[0].Memory.ID != "memory-foreign-tenant" {
+		t.Fatalf("foreign control results=%#v error=%v", foreignHits, err)
+	}
+	assertDeletedScopeRows(t, databaseURL, tenantID, userID, 13)
+}
+
+func TestDeleteEvaluationScopeStateIsPrefixAndContentGuarded(t *testing.T) {
+	ctx := context.Background()
+	databaseURL := requiredDatabaseURL(t)
+	applyMigrations(t, databaseURL)
+	rawTenantID, rawUserID := uniqueScope("eval_cleanup")
+	tenantID, userID := "eval_"+rawTenantID, "eval_"+rawUserID
+	cleanupScopes(t, databaseURL, [][2]string{{tenantID, userID}})
+	storage := openStore(t, databaseURL)
+	defer storage.Close()
+
+	if err := storage.DeleteEvaluationScopeState(ctx, "tenant-production", userID); !errors.Is(err, domain.ErrInvalid) {
+		t.Fatalf("non-evaluation tenant cleanup error=%v, want invalid", err)
+	}
+	if err := storage.DeleteEvaluationScopeState(ctx, tenantID, "user-production"); !errors.Is(err, domain.ErrInvalid) {
+		t.Fatalf("non-evaluation user cleanup error=%v, want invalid", err)
+	}
+
+	candidate := seedCandidate(t, storage, tenantID, userID, "eval-cleanup", "cleanup_key", "cleanup value", 1)
+	if _, _, err := storage.ReviewCandidate(ctx, approval(candidate, "memory-eval-cleanup", 3)); err != nil {
+		t.Fatalf("approve evaluation cleanup fixture: %v", err)
+	}
+	if err := storage.DeleteEvaluationScopeState(ctx, tenantID, userID); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("cleanup with lifecycle content error=%v, want conflict", err)
+	}
+	assertTableRowCount(t, databaseURL, "evidence_events", tenantID, userID, 1)
+	assertTableRowCount(t, databaseURL, "memory_candidates", tenantID, userID, 1)
+	assertTableRowCount(t, databaseURL, "candidate_source_events", tenantID, userID, 1)
+	assertTableRowCount(t, databaseURL, "memory_cards", tenantID, userID, 1)
+	assertTableRowCount(t, databaseURL, "memory_identity_chains", tenantID, userID, 1)
+
+	receipt, err := storage.ForgetUser(ctx, tenantID, userID, fixtureTime(4))
+	if err != nil {
+		t.Fatalf("forget evaluation scope: %v", err)
+	}
+	if receipt.EvidenceDeleted != 1 || receipt.CandidatesDeleted != 1 || receipt.MemoriesDeleted != 1 {
+		t.Fatalf("evaluation cleanup receipt=%#v, want 1/1/1", receipt)
+	}
+	if err := storage.DeleteEvaluationScopeState(ctx, tenantID, userID); err != nil {
+		t.Fatalf("delete empty evaluation scope state: %v", err)
+	}
+	if err := storage.DeleteEvaluationScopeState(ctx, tenantID, userID); err != nil {
+		t.Fatalf("repeat evaluation scope cleanup: %v", err)
+	}
+	assertScopeCompletelyAbsent(t, databaseURL, tenantID, userID)
 }
 
 func TestPostgresStoreCreateCandidateWithMissingSourceRollsBack(t *testing.T) {
@@ -853,5 +1141,33 @@ func assertDeletedScopeRows(t *testing.T, databaseURL, tenantID, userID string, 
 	}
 	if stateRows != 1 || revision != wantRevision {
 		t.Fatalf("retained state rows/revision=%d/%d, want 1/%d", stateRows, revision, wantRevision)
+	}
+}
+
+func assertScopeCompletelyAbsent(t *testing.T, databaseURL, tenantID, userID string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect to inspect complete scope cleanup: %v", err)
+	}
+	defer conn.Close(context.Background())
+	for _, table := range []string{
+		"evidence_events",
+		"memory_candidates",
+		"candidate_source_events",
+		"memory_cards",
+		"memory_identity_chains",
+		"user_scope_state",
+	} {
+		var count int
+		query := fmt.Sprintf("SELECT count(*) FROM agent_memory.%s WHERE tenant_id=$1 AND user_id=$2", table)
+		if err := conn.QueryRow(ctx, query, tenantID, userID).Scan(&count); err != nil {
+			t.Fatalf("count %s after complete scope cleanup: %v", table, err)
+		}
+		if count != 0 {
+			t.Errorf("%s rows after complete scope cleanup=%d, want 0", table, count)
+		}
 	}
 }

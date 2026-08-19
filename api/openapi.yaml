@@ -182,7 +182,7 @@ components:
       required: [status, phase, storage]
       properties:
         status: {type: string, const: ok}
-        phase: {type: string, const: durable-storage}
+        phase: {type: string, const: postgres-fts}
         storage: {type: string, const: postgresql}
     ReadinessStatus:
       type: object

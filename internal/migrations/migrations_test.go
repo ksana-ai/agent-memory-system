@@ -22,8 +22,8 @@ func TestEmbeddedMigrationsLoad(t *testing.T) {
 	if err := migrator.LoadMigrations(files); err != nil {
 		t.Fatalf("load migrations: %v", err)
 	}
-	if len(migrator.Migrations) != 2 {
-		t.Fatalf("migration count = %d, want 2", len(migrator.Migrations))
+	if len(migrator.Migrations) != 3 {
+		t.Fatalf("migration count = %d, want 3", len(migrator.Migrations))
 	}
 	if !strings.Contains(migrator.Migrations[0].UpSQL, "CREATE TABLE agent_memory.memory_cards") {
 		t.Fatal("initial migration does not create memory_cards")
@@ -39,6 +39,18 @@ func TestEmbeddedMigrationsLoad(t *testing.T) {
 	}
 	if !strings.Contains(migrator.Migrations[1].DownSQL, "DROP COLUMN IF EXISTS expires_at") {
 		t.Fatal("expiration migration does not define its rollback")
+	}
+	if !strings.Contains(migrator.Migrations[2].UpSQL, "GENERATED ALWAYS AS") {
+		t.Fatal("FTS migration does not add a generated search document")
+	}
+	if !strings.Contains(migrator.Migrations[2].UpSQL, "'pg_catalog.simple'::regconfig") {
+		t.Fatal("FTS migration does not pin the simple text search configuration")
+	}
+	if !strings.Contains(migrator.Migrations[2].UpSQL, "memory_cards_active_search_document_gin_idx") {
+		t.Fatal("FTS migration does not add its active-card GIN index")
+	}
+	if !strings.Contains(migrator.Migrations[2].DownSQL, "DROP COLUMN IF EXISTS search_document") {
+		t.Fatal("FTS migration does not define its rollback")
 	}
 }
 

@@ -726,16 +726,30 @@ func scanCandidate(row rowScanner, requestedID string) (domain.MemoryCandidate, 
 }
 
 func scanMemory(row rowScanner) (domain.MemoryCard, error) {
+	memory, _, err := scanMemoryRow(row, false)
+	return memory, err
+}
+
+func scanMemoryWithScore(row rowScanner) (domain.MemoryCard, float64, error) {
+	return scanMemoryRow(row, true)
+}
+
+func scanMemoryRow(row rowScanner, withScore bool) (domain.MemoryCard, float64, error) {
 	var memory domain.MemoryCard
+	var score float64
 	var kind, status string
 	var expiresAt, supersededAt pgtype.Timestamptz
-	if err := row.Scan(
+	destinations := []any{
 		&memory.ID, &memory.CandidateID, &memory.TenantID, &memory.UserID, &kind,
 		&memory.Category, &memory.Key, &memory.Value, &memory.Person,
 		&memory.Relationship, &memory.Backstory, &memory.SourceEventIDs,
 		&memory.Version, &status, &memory.CreatedAt, &expiresAt, &supersededAt,
-	); err != nil {
-		return domain.MemoryCard{}, mapPostgresError("scan memory", err)
+	}
+	if withScore {
+		destinations = append(destinations, &score)
+	}
+	if err := row.Scan(destinations...); err != nil {
+		return domain.MemoryCard{}, 0, mapPostgresError("scan memory", err)
 	}
 	memory.Kind = domain.MemoryKind(kind)
 	memory.Status = domain.MemoryStatus(status)
@@ -746,7 +760,7 @@ func scanMemory(row rowScanner) (domain.MemoryCard, error) {
 		value := supersededAt.Time
 		memory.SupersededAt = &value
 	}
-	return memory, nil
+	return memory, score, nil
 }
 
 type rowScanner interface {

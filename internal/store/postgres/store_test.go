@@ -1,11 +1,30 @@
 package postgres
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/kai443/go-agent-memory-system/internal/domain"
 )
+
+func TestSearchEmptyInputDoesNotRequireDatabase(t *testing.T) {
+	storage := &Store{}
+	for _, input := range []struct {
+		query string
+		limit int
+	}{
+		{query: "", limit: 5},
+		{query: "   ", limit: 5},
+		{query: "memory", limit: 0},
+		{query: "memory", limit: -1},
+	} {
+		hits, err := storage.Search(context.Background(), "tenant", "user", input.query, input.limit, time.Now())
+		if err != nil || len(hits) != 0 {
+			t.Fatalf("Search(query=%q, limit=%d) hits=%#v error=%v, want empty success", input.query, input.limit, hits, err)
+		}
+	}
+}
 
 func TestEncodeIdentityUsesDomainNormalization(t *testing.T) {
 	first := domain.MemoryCard{

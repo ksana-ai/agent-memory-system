@@ -10,17 +10,19 @@ The current server runtime path is:
 HTTP API
    │
    ▼
-Application service ─────► Retriever port ─────► BM25 adapter
-   │                              │                    │
-   ▼                              ▼                    │
-Store port ──────────────► PostgreSQL adapter ◄────────┘
-                                  │
-                                  ▼
-                         Docker PostgreSQL 18
-                         + pgvector extension
+Application service ─────► Retriever port ────┐
+   │                                          │
+   ▼                                          ▼
+Store port ──────────────► PostgreSQL adapter / FTS
+                                      │
+                                      ▼
+                             Docker PostgreSQL 18
+                             + pgvector extension
 ```
 
-BM25 loads serviceable cards from PostgreSQL on each search; it is not a separate materialized index. Serviceable means active and either without `expires_at` or with `expires_at` strictly after the request's `as_of` time. The in-memory Store adapter is retained for unit tests and deterministic offline evaluation only. The server binary has no memory fallback.
+The server uses PostgreSQL full-text search directly. Migration 003 adds a STORED generated `tsvector`: memory key has weight A, value B, category/person/relationship C, and backstory D. A partial GIN index covers active cards. Plain query text is tokenized with the fixed `simple` configuration; the resulting lexemes are safely quoted and OR-combined before `ts_rank_cd` ranking. Scope, active status, and expiration are filtered in the same SQL statement, followed by deterministic `created_at`/ID tie-breaking.
+
+Serviceable means active and either without `expires_at` or with `expires_at` strictly after the request's `as_of` time. The in-memory Store and Go BM25 adapters are retained for unit tests and deterministic comparison only. The server binary has no memory or BM25 fallback.
 
 ## Data layers
 
@@ -88,7 +90,7 @@ Rejection updates only the candidate and does not advance the retrieval revision
 4. evidence events;
 5. then increments the retained revision and records `last_deleted_at`.
 
-Because BM25 reads PostgreSQL directly, deletion reaches the current retrieval path at commit; there is no asynchronous projection to lag. The process integration test proves data is not returned after the DELETE response and remains absent after another server restart. Other tenant/user scopes are retained as controls.
+Because the FTS document is a generated column on `memory_cards`, deletion reaches the current retrieval path in the same commit; there is no asynchronous search projection to lag. The process integration test proves data is not returned after the DELETE response and remains absent after another server restart. Other tenant/user scopes are retained as controls.
 
 `BuildContext` compares the scope revision before and after its multi-statement retrieval and retries when it observes a concurrent change. This is an optimistic consistency guard, not a single serializable read transaction. The current propagation guarantee applies to requests begun after erasure commits; an HTTP request already in flight at commit is not proven to be a linearizable privacy barrier.
 
@@ -100,7 +102,7 @@ Docker Compose pins `pgvector/pgvector:0.8.6-pg18-bookworm`, binds PostgreSQL to
 
 Versioned SQL is embedded into both `cmd/migrate` and `cmd/server`. Tern applies each migration transactionally and serializes concurrent migrators with an advisory lock. Migrations do not rely on `/docker-entrypoint-initdb.d`, so an existing named volume can be upgraded.
 
-The initial migration installs pgvector but intentionally creates no embedding column or ANN index. A second migration adds candidate/card expiration and the serviceability lookup index. Vector dimensions and distance semantics must follow a measured embedding choice, not precede one.
+The initial migration installs pgvector but intentionally creates no embedding column or ANN index. A second migration adds candidate/card expiration and the serviceability lookup index. A third migration adds the generated FTS document and partial GIN index. Vector dimensions and distance semantics must follow a measured embedding endpoint, not precede one.
 
 ## Trust boundaries
 
@@ -109,4 +111,4 @@ The initial migration installs pgvector but intentionally creates no embedding c
 - Extracted content is data, never an instruction to execute tools.
 - Database constraints and scoped SQL are the enforcement layer; prompt instructions are not a security boundary.
 - `/healthz` proves only that the process is alive. `/readyz` separately pings PostgreSQL.
-- Retrieval scores are lexical ranking values, not truth confidence.
+- Retrieval scores are lexical ranking values, not truth confidence. The fixed `simple` configuration is a reproducible baseline, not language-aware semantic retrieval; the lifecycle fixture already exposes paraphrase and multilingual misses.

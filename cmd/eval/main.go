@@ -44,6 +44,7 @@ func run(ctx context.Context, arguments []string, stdout, stderr io.Writer) erro
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected positional arguments: %s", strings.Join(flags.Args(), " "))
 	}
+	postgresURL := os.Getenv("TEST_DATABASE_URL")
 
 	data, err := os.ReadFile(*datasetPath)
 	if err != nil {
@@ -70,7 +71,7 @@ func run(ctx context.Context, arguments []string, stdout, stderr io.Writer) erro
 		if loadErr != nil {
 			return fmt.Errorf("load v2 dataset: %w", loadErr)
 		}
-		arms, armErr := selectArmFactories(*armIDs)
+		arms, armErr := selectArmFactories(ctx, *armIDs, postgresURL)
 		if armErr != nil {
 			return armErr
 		}
@@ -161,7 +162,7 @@ func detectDatasetSchema(data []byte) (string, error) {
 	return envelope.SchemaVersion, nil
 }
 
-func selectArmFactories(value string) ([]memoryeval.ArmFactory, error) {
+func selectArmFactories(ctx context.Context, value, postgresURL string) ([]memoryeval.ArmFactory, error) {
 	if strings.TrimSpace(value) == "" {
 		return memoryeval.BuiltinArmFactories(), nil
 	}
@@ -175,7 +176,13 @@ func selectArmFactories(value string) ([]memoryeval.ArmFactory, error) {
 		if _, exists := seen[id]; exists {
 			return nil, fmt.Errorf("duplicate evaluation arm %q", id)
 		}
-		factory, err := memoryeval.BuiltinArmFactory(id)
+		var factory memoryeval.ArmFactory
+		var err error
+		if id == memoryeval.ArmReviewedCardsPostgresFTSV1 {
+			factory, err = memoryeval.NewPostgresFTSArmFactory(ctx, postgresURL)
+		} else {
+			factory, err = memoryeval.BuiltinArmFactory(id)
+		}
 		if err != nil {
 			return nil, err
 		}

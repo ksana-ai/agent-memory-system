@@ -42,6 +42,7 @@ func TestServerProcessRestartRecoveryAndDeletePropagation(t *testing.T) {
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	first := startServer(t, serverBinary, databaseURL)
+	assertServerPhase(t, client, first.baseURL, "postgres-fts")
 	targetCandidate := ingestProposeApprove(t, client, first.baseURL, tenantID, userID, "event-restart", "prefers a window seat", "seat_preference", "window")
 	if targetCandidate == "" {
 		t.Fatal("target candidate id is empty")
@@ -257,6 +258,19 @@ func assertContextPack(t *testing.T, client *http.Client, baseURL, tenantID, use
 		if len(pack.Items[0].Sources) != 1 || pack.Items[0].Sources[0].TenantID != tenantID || pack.Items[0].Sources[0].UserID != userID {
 			t.Fatalf("context sources=%#v", pack.Items[0].Sources)
 		}
+	}
+}
+
+func assertServerPhase(t *testing.T, client *http.Client, baseURL, wantPhase string) {
+	t.Helper()
+	var health struct {
+		Status  string `json:"status"`
+		Phase   string `json:"phase"`
+		Storage string `json:"storage"`
+	}
+	doServerJSON(t, client, http.MethodGet, baseURL+"/healthz", "", "", nil, http.StatusOK, &health)
+	if health.Status != "ok" || health.Phase != wantPhase || health.Storage != "postgresql" {
+		t.Fatalf("health response=%#v, want phase %q with PostgreSQL", health, wantPhase)
 	}
 }
 
