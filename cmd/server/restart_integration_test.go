@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/kai443/go-agent-memory-system/internal/domain"
 	"github.com/kai443/go-agent-memory-system/internal/migrations"
+	"github.com/kai443/go-agent-memory-system/internal/store/postgres"
 )
 
 func TestServerProcessRestartRecoveryAndDeletePropagation(t *testing.T) {
@@ -39,6 +40,7 @@ func TestServerProcessRestartRecoveryAndDeletePropagation(t *testing.T) {
 	tenantID, userID := "tenant_restart_"+suffix, "user_restart_"+suffix
 	controlTenantID, controlUserID := "tenant_control_"+suffix, "user_control_"+suffix
 	cleanupServerTestScopes(t, databaseURL, [][2]string{{tenantID, userID}, {controlTenantID, controlUserID}})
+	embeddingSpace := registerServerProjectionTarget(t, databaseURL, suffix)
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	first := startServer(t, serverBinary, databaseURL)
@@ -51,22 +53,30 @@ func TestServerProcessRestartRecoveryAndDeletePropagation(t *testing.T) {
 	if controlCandidate == "" {
 		t.Fatal("control candidate id is empty")
 	}
+	assertServerProjectionJobCount(t, databaseURL, tenantID, userID, embeddingSpace, 1)
+	assertServerProjectionJobCount(t, databaseURL, controlTenantID, controlUserID, embeddingSpace, 1)
 	assertContextPack(t, client, first.baseURL, tenantID, userID, "window", "window", 1)
 	first.stop(t)
+	assertServerProjectionJobCount(t, databaseURL, tenantID, userID, embeddingSpace, 1)
 
 	second := startServer(t, serverBinary, databaseURL)
+	assertServerProjectionJobCount(t, databaseURL, tenantID, userID, embeddingSpace, 1)
 	assertContextPack(t, client, second.baseURL, tenantID, userID, "window", "window", 1)
 	var receipt domain.DeletionReceipt
 	doServerJSON(t, client, http.MethodDelete, second.baseURL+"/v1/users/"+url.PathEscape(userID), tenantID, "", nil, http.StatusOK, &receipt)
 	if receipt.EvidenceDeleted != 1 || receipt.CandidatesDeleted != 1 || receipt.MemoriesDeleted != 1 {
 		t.Fatalf("deletion receipt=%#v, want evidence/candidates/memories 1/1/1", receipt)
 	}
+	assertServerProjectionJobCount(t, databaseURL, tenantID, userID, embeddingSpace, 0)
+	assertServerProjectionJobCount(t, databaseURL, controlTenantID, controlUserID, embeddingSpace, 1)
 	assertContextPack(t, client, second.baseURL, tenantID, userID, "window", "", 0)
 	second.stop(t)
 
 	third := startServer(t, serverBinary, databaseURL)
 	assertContextPack(t, client, third.baseURL, tenantID, userID, "window", "", 0)
 	assertContextPack(t, client, third.baseURL, controlTenantID, controlUserID, "tea", "green tea", 1)
+	assertServerProjectionJobCount(t, databaseURL, tenantID, userID, embeddingSpace, 0)
+	assertServerProjectionJobCount(t, databaseURL, controlTenantID, controlUserID, embeddingSpace, 1)
 	assertServerTestDeletedRows(t, databaseURL, tenantID, userID, 2)
 	third.stop(t)
 }
@@ -332,6 +342,93 @@ func applyServerTestMigrations(t *testing.T, databaseURL string) {
 	}
 }
 
+func registerServerProjectionTarget(t *testing.T, databaseURL, suffix string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	storage, err := postgres.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("open PostgreSQL to register restart projection target: %v", err)
+	}
+	embeddingSpace := "space_restart_" + suffix
+	createdAt := time.Now().UTC().Truncate(time.Microsecond)
+	_, err = storage.RegisterProjectionTarget(ctx, postgres.RegisterProjectionTargetCommand{
+		Space: postgres.EmbeddingSpaceDefinition{
+			ID:               embeddingSpace,
+			Provider:         "restart-integration",
+			Model:            "deterministic-test-model",
+			Dimension:        postgres.VectorDimension,
+			DocumentVersion:  "memory-card-document-v1",
+			QueryVersion:     "raw-query-v1",
+			ModelFingerprint: strings.Repeat("d", 64),
+			CreatedAt:        createdAt,
+		},
+		State:      postgres.ProjectionTargetShadow,
+		EnqueueNew: true,
+		CreatedAt:  createdAt,
+	})
+	storage.Close()
+	if err != nil {
+		t.Fatalf("register restart projection target: %v", err)
+	}
+
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cleanupCancel()
+		connection, cleanupErr := pgx.Connect(cleanupContext, databaseURL)
+		if cleanupErr != nil {
+			t.Errorf("connect to clean restart projection target: %v", cleanupErr)
+			return
+		}
+		defer connection.Close(context.Background())
+		for _, statement := range []string{
+			"DELETE FROM agent_memory.embedding_projection_targets WHERE embedding_space=$1",
+			"DELETE FROM agent_memory.embedding_projection_jobs WHERE embedding_space=$1",
+			"DELETE FROM agent_memory.memory_embeddings WHERE embedding_space=$1",
+			"DELETE FROM agent_memory.embedding_spaces WHERE id=$1",
+		} {
+			if _, cleanupErr = connection.Exec(cleanupContext, statement, embeddingSpace); cleanupErr != nil {
+				t.Errorf("clean restart projection target: %v", cleanupErr)
+				return
+			}
+		}
+	})
+	return embeddingSpace
+}
+
+func assertServerProjectionJobCount(t *testing.T, databaseURL, tenantID, userID, embeddingSpace string, want int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	connection, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect to inspect restart projection jobs: %v", err)
+	}
+	defer connection.Close(context.Background())
+	var count, validPending int
+	if err := connection.QueryRow(ctx, `
+		SELECT count(*),
+		       count(*) FILTER (WHERE state='pending' AND expected_memory_version=1)
+		FROM agent_memory.embedding_projection_jobs
+		WHERE tenant_id=$1 AND user_id=$2 AND embedding_space=$3`,
+		tenantID, userID, embeddingSpace,
+	).Scan(&count, &validPending); err != nil {
+		t.Fatalf("count restart projection jobs: %v", err)
+	}
+	if count != want || validPending != want {
+		t.Fatalf(
+			"restart projection jobs for %s/%s in %s total/valid_pending=%d/%d, want %d/%d",
+			tenantID,
+			userID,
+			embeddingSpace,
+			count,
+			validPending,
+			want,
+			want,
+		)
+	}
+}
+
 func cleanupServerTestScopes(t *testing.T, databaseURL string, scopes [][2]string) {
 	t.Helper()
 	t.Cleanup(func() {
@@ -364,7 +461,7 @@ func assertServerTestDeletedRows(t *testing.T, databaseURL, tenantID, userID str
 		t.Fatalf("connect to inspect process-test deletion: %v", err)
 	}
 	defer conn.Close(context.Background())
-	for _, table := range []string{"evidence_events", "memory_candidates", "candidate_source_events", "memory_cards", "memory_identity_chains"} {
+	for _, table := range []string{"evidence_events", "memory_candidates", "candidate_source_events", "memory_cards", "memory_embeddings", "embedding_projection_jobs", "memory_identity_chains"} {
 		var count int
 		query := fmt.Sprintf("SELECT count(*) FROM agent_memory.%s WHERE tenant_id=$1 AND user_id=$2", table)
 		if err := conn.QueryRow(ctx, query, tenantID, userID).Scan(&count); err != nil {

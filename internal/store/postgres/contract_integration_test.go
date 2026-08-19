@@ -618,6 +618,7 @@ func TestDeleteEvaluationScopeStateIsPrefixAndContentGuarded(t *testing.T) {
 	rawTenantID, rawUserID := uniqueScope("eval_cleanup")
 	tenantID, userID := "eval_"+rawTenantID, "eval_"+rawUserID
 	cleanupScopes(t, databaseURL, [][2]string{{tenantID, userID}})
+	evalCleanupSpace := registerProjectionTarget(t, databaseURL, "eval_cleanup", "shadow", true)
 	storage := openStore(t, databaseURL)
 	defer storage.Close()
 
@@ -639,6 +640,9 @@ func TestDeleteEvaluationScopeStateIsPrefixAndContentGuarded(t *testing.T) {
 	assertTableRowCount(t, databaseURL, "memory_candidates", tenantID, userID, 1)
 	assertTableRowCount(t, databaseURL, "candidate_source_events", tenantID, userID, 1)
 	assertTableRowCount(t, databaseURL, "memory_cards", tenantID, userID, 1)
+	if countProjectionJobsForMemoryAndSpace(t, databaseURL, tenantID, userID, "memory-eval-cleanup", evalCleanupSpace) != 1 {
+		t.Fatal("evaluation fixture did not enqueue its projection job")
+	}
 	assertTableRowCount(t, databaseURL, "memory_identity_chains", tenantID, userID, 1)
 
 	receipt, err := storage.ForgetUser(ctx, tenantID, userID, fixtureTime(4))
@@ -679,6 +683,151 @@ func TestPostgresStoreCreateCandidateWithMissingSourceRollsBack(t *testing.T) {
 	assertTableRowCount(t, databaseURL, "candidate_source_events", tenantID, userID, 0)
 	if _, err := storage.EvidenceByID(ctx, tenantID, userID, realEvent.ID); err != nil {
 		t.Fatalf("valid source was changed by failed candidate transaction: %v", err)
+	}
+}
+
+func TestPostgresStoreApprovalEnqueuesOnlyEligibleProjectionTargetsAndRejectionDoesNotEnqueue(t *testing.T) {
+	ctx := context.Background()
+	databaseURL := requiredDatabaseURL(t)
+	applyMigrations(t, databaseURL)
+	tenantID, userID := uniqueScope("projection_enqueue")
+	cleanupScopes(t, databaseURL, [][2]string{{tenantID, userID}})
+	shadowSpace := registerProjectionTarget(t, databaseURL, "projection_enqueue_shadow", "shadow", true)
+	servingSpace, servingEnqueueNew := projectionServingTargetForTest(t, databaseURL, "projection_enqueue_serving")
+	disabledSpace := registerProjectionTarget(t, databaseURL, "projection_enqueue_disabled", "shadow", false)
+	blockedSpace := registerProjectionTarget(t, databaseURL, "projection_enqueue_blocked", "blocked", false)
+	_ = registerProjectionTarget(t, databaseURL, "projection_enqueue_unrelated", "shadow", true)
+
+	storage := openStore(t, databaseURL)
+	defer storage.Close()
+	approvedCandidate := seedCandidate(t, storage, tenantID, userID, "projection-approved", "projection_key", "projection value", 1)
+	_, card, err := storage.ReviewCandidate(ctx, approval(approvedCandidate, "memory-projection-approved", 3))
+	if err != nil || card == nil {
+		t.Fatalf("approve projection candidate: card=%#v error=%v", card, err)
+	}
+
+	eligibleSpaces := []string{shadowSpace}
+	excludedSpaces := []string{disabledSpace, blockedSpace}
+	if servingEnqueueNew {
+		eligibleSpaces = append(eligibleSpaces, servingSpace)
+	} else {
+		excludedSpaces = append(excludedSpaces, servingSpace)
+	}
+	for _, eligibleSpace := range eligibleSpaces {
+		job, found := projectionJobForMemoryAndSpace(t, databaseURL, tenantID, userID, card.ID, eligibleSpace)
+		if !found || job.state != "pending" || job.expectedMemoryVersion != card.Version {
+			t.Fatalf("projection job for eligible space %q=%#v found=%t, want pending card version %d", eligibleSpace, job, found, card.Version)
+		}
+	}
+	for _, excludedSpace := range excludedSpaces {
+		if countProjectionJobsForMemoryAndSpace(t, databaseURL, tenantID, userID, card.ID, excludedSpace) != 0 {
+			t.Fatalf("excluded projection space %q received a job", excludedSpace)
+		}
+	}
+
+	beforeRejection := countProjectionJobsForScope(t, databaseURL, tenantID, userID)
+	rejectedCandidate := seedCandidate(t, storage, tenantID, userID, "projection-rejected", "rejected_key", "rejected value", 4)
+	if _, rejectedCard, err := storage.ReviewCandidate(ctx, rejection(rejectedCandidate, 6)); err != nil || rejectedCard != nil {
+		t.Fatalf("reject projection candidate: card=%#v error=%v", rejectedCard, err)
+	}
+	if afterRejection := countProjectionJobsForScope(t, databaseURL, tenantID, userID); afterRejection != beforeRejection {
+		t.Fatalf("projection jobs after rejection=%d, want unchanged %d", afterRejection, beforeRejection)
+	}
+}
+
+func TestPostgresStoreSupersedeDeletesOldEmbeddingAndProjectionJob(t *testing.T) {
+	ctx := context.Background()
+	databaseURL := requiredDatabaseURL(t)
+	applyMigrations(t, databaseURL)
+	tenantID, userID := uniqueScope("projection_supersede")
+	cleanupScopes(t, databaseURL, [][2]string{{tenantID, userID}})
+	embeddingSpace := registerProjectionTarget(t, databaseURL, "projection_supersede", "shadow", true)
+	storage := openStore(t, databaseURL)
+	defer storage.Close()
+
+	first := seedCandidate(t, storage, tenantID, userID, "projection-old", "versioned_projection", "old value", 1)
+	_, oldCard, err := storage.ReviewCandidate(ctx, approval(first, "memory-projection-old", 3))
+	if err != nil || oldCard == nil {
+		t.Fatalf("approve old projection card: card=%#v error=%v", oldCard, err)
+	}
+	if err := storage.UpsertMemoryEmbedding(ctx, projectionTestEmbedding(*oldCard, embeddingSpace, 4)); err != nil {
+		t.Fatalf("insert old projection embedding: %v", err)
+	}
+	if countProjectionJobsForMemoryAndSpace(t, databaseURL, tenantID, userID, oldCard.ID, embeddingSpace) != 1 {
+		t.Fatal("old projection job is missing before supersede")
+	}
+	assertEmbeddingCountForMemory(t, databaseURL, tenantID, userID, oldCard.ID, 1)
+
+	second := seedCandidate(t, storage, tenantID, userID, "projection-new", "versioned_projection", "new value", 5)
+	_, newCard, err := storage.ReviewCandidate(ctx, approval(second, "memory-projection-new", 7))
+	if err != nil || newCard == nil {
+		t.Fatalf("approve replacement projection card: card=%#v error=%v", newCard, err)
+	}
+	if countProjectionJobsForMemoryAndSpace(t, databaseURL, tenantID, userID, oldCard.ID, embeddingSpace) != 0 {
+		t.Fatal("superseded projection job remains")
+	}
+	assertEmbeddingCountForMemory(t, databaseURL, tenantID, userID, oldCard.ID, 0)
+	job, found := projectionJobForMemoryAndSpace(t, databaseURL, tenantID, userID, newCard.ID, embeddingSpace)
+	if !found || job.expectedMemoryVersion != 2 || job.state != "pending" {
+		t.Fatalf("replacement projection job=%#v found=%t, want pending version-2 job", job, found)
+	}
+}
+
+func TestPostgresStoreProjectionJobFailureRollsBackApproval(t *testing.T) {
+	ctx := context.Background()
+	databaseURL := requiredDatabaseURL(t)
+	applyMigrations(t, databaseURL)
+	tenantID, userID := uniqueScope("projection_job_rollback")
+	cleanupScopes(t, databaseURL, [][2]string{{tenantID, userID}})
+	embeddingSpace := registerProjectionTarget(t, databaseURL, "projection_job_rollback", "shadow", true)
+	storage := openStore(t, databaseURL)
+	defer storage.Close()
+
+	original := seedCandidate(t, storage, tenantID, userID, "projection-job-original", "rollback_projection", "original value", 1)
+	_, originalCard, err := storage.ReviewCandidate(ctx, approval(original, "memory-projection-job-original", 3))
+	if err != nil || originalCard == nil {
+		t.Fatalf("approve original projection card: card=%#v error=%v", originalCard, err)
+	}
+	if err := storage.UpsertMemoryEmbedding(ctx, projectionTestEmbedding(*originalCard, embeddingSpace, 4)); err != nil {
+		t.Fatalf("insert original projection embedding: %v", err)
+	}
+	revisionBefore, err := storage.ContextRevision(ctx, tenantID, userID)
+	if err != nil {
+		t.Fatalf("load revision before injected projection failure: %v", err)
+	}
+
+	candidate := seedCandidate(t, storage, tenantID, userID, "projection-job-rollback", "rollback_projection", "replacement value", 5)
+	installProjectionJobFailureTrigger(t, databaseURL, tenantID, userID)
+	_, card, err := storage.ReviewCandidate(ctx, approval(candidate, "memory-projection-job-rollback", 7))
+	if err == nil || card != nil {
+		t.Fatalf("approval with injected projection failure: card=%#v error=%v, want failure", card, err)
+	}
+	if strings.Contains(err.Error(), projectionJobFailureSecret) {
+		t.Fatalf("approval error exposed injected database diagnostic: %q", err)
+	}
+	loaded, err := storage.CandidateByID(ctx, tenantID, userID, candidate.ID)
+	if err != nil {
+		t.Fatalf("load candidate after projection rollback: %v", err)
+	}
+	if loaded.Status != domain.CandidatePending || loaded.Review != nil {
+		t.Fatalf("candidate after projection rollback=%#v, want pending without review", loaded)
+	}
+	if revision, err := storage.ContextRevision(ctx, tenantID, userID); err != nil || revision != revisionBefore {
+		t.Fatalf("revision after projection rollback=%d error=%v, want unchanged %d", revision, err, revisionBefore)
+	}
+	active, err := storage.ListServiceableMemories(ctx, tenantID, userID, fixtureTime(100))
+	if err != nil || len(active) != 1 || active[0].ID != originalCard.ID || active[0].Status != domain.MemoryActive {
+		t.Fatalf("active memories after projection rollback=%#v error=%v, want original active card", active, err)
+	}
+	assertTableRowCount(t, databaseURL, "memory_cards", tenantID, userID, 1)
+	assertTableRowCount(t, databaseURL, "memory_identity_chains", tenantID, userID, 1)
+	assertIdentityLatestVersion(t, databaseURL, tenantID, userID, 1)
+	assertEmbeddingCountForMemory(t, databaseURL, tenantID, userID, originalCard.ID, 1)
+	if countProjectionJobsForMemoryAndSpace(t, databaseURL, tenantID, userID, originalCard.ID, embeddingSpace) != 1 {
+		t.Fatal("original projection job was not restored by rollback")
+	}
+	if countProjectionJobsForMemoryAndSpace(t, databaseURL, tenantID, userID, "memory-projection-job-rollback", embeddingSpace) != 0 {
+		t.Fatal("failed replacement left a projection job")
 	}
 }
 
@@ -727,6 +876,7 @@ func TestPostgresStoreApproveRacingForgetHasNoPartialState(t *testing.T) {
 	applyMigrations(t, databaseURL)
 	tenantID, userID := uniqueScope("approve_forget")
 	cleanupScopes(t, databaseURL, [][2]string{{tenantID, userID}})
+	registerProjectionTarget(t, databaseURL, "approve_forget", "shadow", true)
 	storage := openStore(t, databaseURL)
 	defer storage.Close()
 
@@ -824,6 +974,7 @@ func TestPostgresStoreForgetPropagatesAndRetainsMonotonicRevision(t *testing.T) 
 	tenantID, userID := uniqueScope("forget")
 	controlTenantID, controlUserID := uniqueScope("forget_control")
 	cleanupScopes(t, databaseURL, [][2]string{{tenantID, userID}, {controlTenantID, controlUserID}})
+	registerProjectionTarget(t, databaseURL, "forget", "shadow", true)
 	storage := openStore(t, databaseURL)
 	defer storage.Close()
 
@@ -1012,6 +1163,316 @@ func eventIDs(events []domain.EvidenceEvent) []string {
 	return ids
 }
 
+const (
+	projectionTestProvider         = "lmstudio"
+	projectionTestModel            = "text-embedding-bge-m3"
+	projectionTestDocumentVersion  = "memory-card-document-v1"
+	projectionTestQueryVersion     = "raw-query-v1"
+	projectionTestModelFingerprint = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	projectionJobFailureSecret     = "top_secret_projection_failure"
+)
+
+type projectionJobFixture struct {
+	embeddingSpace        string
+	state                 string
+	expectedMemoryVersion int
+}
+
+func registerProjectionTarget(t *testing.T, databaseURL, label, state string, enqueueNew bool) string {
+	t.Helper()
+	sequence := scopeSequence.Add(1)
+	embeddingSpace := fmt.Sprintf("space_contract_%s_%d_%d", label, time.Now().UnixNano(), sequence)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect to register projection target: %v", err)
+	}
+	timestamp := time.Now().UTC().Truncate(time.Microsecond)
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		_ = conn.Close(context.Background())
+		t.Fatalf("begin projection target registration: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO agent_memory.embedding_spaces (
+			id, provider, model, dimension, document_version, query_version,
+			model_fingerprint, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		embeddingSpace, projectionTestProvider, projectionTestModel, postgres.VectorDimension,
+		projectionTestDocumentVersion, projectionTestQueryVersion,
+		projectionTestModelFingerprint, timestamp,
+	); err != nil {
+		_ = tx.Rollback(ctx)
+		_ = conn.Close(context.Background())
+		t.Fatalf("register embedding space %q: %v", embeddingSpace, err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO agent_memory.embedding_projection_targets (
+			embedding_space, state, enqueue_new, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $4)`, embeddingSpace, state, enqueueNew, timestamp); err != nil {
+		_ = tx.Rollback(ctx)
+		_ = conn.Close(context.Background())
+		t.Fatalf("register projection target %q: %v", embeddingSpace, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		_ = conn.Close(context.Background())
+		t.Fatalf("commit projection target %q: %v", embeddingSpace, err)
+	}
+	if err := conn.Close(context.Background()); err != nil {
+		t.Fatalf("close projection target connection: %v", err)
+	}
+
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cleanupCancel()
+		cleanupConnection, cleanupErr := pgx.Connect(cleanupContext, databaseURL)
+		if cleanupErr != nil {
+			t.Errorf("connect to clean projection target %q: %v", embeddingSpace, cleanupErr)
+			return
+		}
+		defer cleanupConnection.Close(context.Background())
+		cleanupTransaction, cleanupErr := cleanupConnection.Begin(cleanupContext)
+		if cleanupErr != nil {
+			t.Errorf("begin cleanup for projection target %q: %v", embeddingSpace, cleanupErr)
+			return
+		}
+		for _, statement := range []string{
+			"DELETE FROM agent_memory.embedding_projection_targets WHERE embedding_space=$1",
+			"DELETE FROM agent_memory.embedding_projection_jobs WHERE embedding_space=$1",
+			"DELETE FROM agent_memory.memory_embeddings WHERE embedding_space=$1",
+			"DELETE FROM agent_memory.embedding_spaces WHERE id=$1",
+		} {
+			if _, cleanupErr = cleanupTransaction.Exec(cleanupContext, statement, embeddingSpace); cleanupErr != nil {
+				_ = cleanupTransaction.Rollback(cleanupContext)
+				t.Errorf("clean projection target %q: %v", embeddingSpace, cleanupErr)
+				return
+			}
+		}
+		if cleanupErr = cleanupTransaction.Commit(cleanupContext); cleanupErr != nil {
+			t.Errorf("commit cleanup for projection target %q: %v", embeddingSpace, cleanupErr)
+		}
+	})
+	return embeddingSpace
+}
+
+// projectionServingTargetForTest avoids assuming the shared development
+// database has no legitimate serving target. If one already exists, the test
+// observes its enqueue_new contract without mutating or deleting it; otherwise
+// it creates and cleans a test-owned serving target.
+func projectionServingTargetForTest(t *testing.T, databaseURL, label string) (string, bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect to inspect serving projection target: %v", err)
+	}
+	var embeddingSpace string
+	var enqueueNew bool
+	err = conn.QueryRow(ctx, `
+		SELECT embedding_space, enqueue_new
+		FROM agent_memory.embedding_projection_targets
+		WHERE state='serving'`).Scan(&embeddingSpace, &enqueueNew)
+	if closeErr := conn.Close(context.Background()); closeErr != nil {
+		t.Fatalf("close serving projection target connection: %v", closeErr)
+	}
+	if err == nil {
+		return embeddingSpace, enqueueNew
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("inspect serving projection target: %v", err)
+	}
+	return registerProjectionTarget(t, databaseURL, label, "serving", true), true
+}
+
+func projectionJobsForMemory(t *testing.T, databaseURL, tenantID, userID, memoryID string) []projectionJobFixture {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect to inspect projection jobs: %v", err)
+	}
+	defer conn.Close(context.Background())
+	rows, err := conn.Query(ctx, `
+		SELECT embedding_space, state, expected_memory_version
+		FROM agent_memory.embedding_projection_jobs
+		WHERE tenant_id=$1 AND user_id=$2 AND memory_id=$3
+		ORDER BY embedding_space`, tenantID, userID, memoryID)
+	if err != nil {
+		t.Fatalf("query projection jobs: %v", err)
+	}
+	defer rows.Close()
+	var jobs []projectionJobFixture
+	for rows.Next() {
+		var job projectionJobFixture
+		if err := rows.Scan(&job.embeddingSpace, &job.state, &job.expectedMemoryVersion); err != nil {
+			t.Fatalf("scan projection job: %v", err)
+		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate projection jobs: %v", err)
+	}
+	return jobs
+}
+
+func projectionJobForMemoryAndSpace(
+	t *testing.T,
+	databaseURL, tenantID, userID, memoryID, embeddingSpace string,
+) (projectionJobFixture, bool) {
+	t.Helper()
+	for _, job := range projectionJobsForMemory(t, databaseURL, tenantID, userID, memoryID) {
+		if job.embeddingSpace == embeddingSpace {
+			return job, true
+		}
+	}
+	return projectionJobFixture{}, false
+}
+
+func countProjectionJobsForScope(t *testing.T, databaseURL, tenantID, userID string) int {
+	t.Helper()
+	return countProjectionJobs(t, databaseURL, tenantID, userID, "", "")
+}
+
+func countProjectionJobsForMemoryAndSpace(t *testing.T, databaseURL, tenantID, userID, memoryID, embeddingSpace string) int {
+	t.Helper()
+	return countProjectionJobs(t, databaseURL, tenantID, userID, memoryID, embeddingSpace)
+}
+
+func countProjectionJobs(t *testing.T, databaseURL, tenantID, userID, memoryID, embeddingSpace string) int {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect to count projection jobs: %v", err)
+	}
+	defer conn.Close(context.Background())
+	query := `
+		SELECT count(*)
+		FROM agent_memory.embedding_projection_jobs
+		WHERE tenant_id=$1 AND user_id=$2`
+	arguments := []any{tenantID, userID}
+	if memoryID != "" {
+		query += " AND memory_id=$3"
+		arguments = append(arguments, memoryID)
+	}
+	if embeddingSpace != "" {
+		query += fmt.Sprintf(" AND embedding_space=$%d", len(arguments)+1)
+		arguments = append(arguments, embeddingSpace)
+	}
+	var count int
+	if err := conn.QueryRow(ctx, query, arguments...).Scan(&count); err != nil {
+		t.Fatalf("count projection jobs: %v", err)
+	}
+	return count
+}
+
+func projectionTestEmbedding(card domain.MemoryCard, embeddingSpace string, offset int) postgres.MemoryEmbedding {
+	vector := make([]float32, postgres.VectorDimension)
+	vector[0] = 1
+	return postgres.MemoryEmbedding{
+		TenantID:         card.TenantID,
+		UserID:           card.UserID,
+		MemoryID:         card.ID,
+		EmbeddingSpace:   embeddingSpace,
+		Provider:         projectionTestProvider,
+		Model:            projectionTestModel,
+		DocumentVersion:  projectionTestDocumentVersion,
+		QueryVersion:     projectionTestQueryVersion,
+		ModelFingerprint: projectionTestModelFingerprint,
+		ContentSHA256:    strings.Repeat("c", 64),
+		Vector:           vector,
+		CreatedAt:        fixtureTime(offset),
+	}
+}
+
+func assertEmbeddingCountForMemory(t *testing.T, databaseURL, tenantID, userID, memoryID string, want int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect to count memory embeddings: %v", err)
+	}
+	defer conn.Close(context.Background())
+	var count int
+	if err := conn.QueryRow(ctx, `
+		SELECT count(*) FROM agent_memory.memory_embeddings
+		WHERE tenant_id=$1 AND user_id=$2 AND memory_id=$3`, tenantID, userID, memoryID).Scan(&count); err != nil {
+		t.Fatalf("count memory embeddings: %v", err)
+	}
+	if count != want {
+		t.Fatalf("memory embedding rows for %q=%d, want %d", memoryID, count, want)
+	}
+}
+
+func installProjectionJobFailureTrigger(t *testing.T, databaseURL, tenantID, userID string) {
+	t.Helper()
+	sequence := scopeSequence.Add(1)
+	functionName := fmt.Sprintf("test_projection_job_failure_%d", sequence)
+	triggerName := fmt.Sprintf("test_projection_job_failure_%d", sequence)
+	qualifiedFunction := pgx.Identifier{"agent_memory", functionName}.Sanitize()
+	quotedTrigger := pgx.Identifier{triggerName}.Sanitize()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect to install projection failure trigger: %v", err)
+	}
+	functionSQL := fmt.Sprintf(`
+		CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $body$
+		BEGIN
+			IF NEW.tenant_id = %s AND NEW.user_id = %s THEN
+				RAISE EXCEPTION %s;
+			END IF;
+			RETURN NEW;
+		END
+		$body$`, qualifiedFunction, postgresTestLiteral(tenantID), postgresTestLiteral(userID), postgresTestLiteral(projectionJobFailureSecret))
+	if _, err := conn.Exec(ctx, functionSQL); err != nil {
+		_ = conn.Close(context.Background())
+		t.Fatalf("create projection failure function: %v", err)
+	}
+	triggerSQL := fmt.Sprintf(`
+		CREATE TRIGGER %s
+		BEFORE INSERT ON agent_memory.embedding_projection_jobs
+		FOR EACH ROW EXECUTE FUNCTION %s()`, quotedTrigger, qualifiedFunction)
+	if _, err := conn.Exec(ctx, triggerSQL); err != nil {
+		_, _ = conn.Exec(ctx, "DROP FUNCTION "+qualifiedFunction+"()")
+		_ = conn.Close(context.Background())
+		t.Fatalf("create projection failure trigger: %v", err)
+	}
+	if err := conn.Close(context.Background()); err != nil {
+		t.Fatalf("close projection failure connection: %v", err)
+	}
+
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		cleanupConnection, cleanupErr := pgx.Connect(cleanupContext, databaseURL)
+		if cleanupErr != nil {
+			t.Errorf("connect to remove projection failure trigger: %v", cleanupErr)
+			return
+		}
+		defer cleanupConnection.Close(context.Background())
+		if _, cleanupErr = cleanupConnection.Exec(cleanupContext, fmt.Sprintf(
+			"DROP TRIGGER IF EXISTS %s ON agent_memory.embedding_projection_jobs", quotedTrigger,
+		)); cleanupErr != nil {
+			t.Errorf("drop projection failure trigger: %v", cleanupErr)
+			return
+		}
+		if _, cleanupErr = cleanupConnection.Exec(cleanupContext, "DROP FUNCTION IF EXISTS "+qualifiedFunction+"()"); cleanupErr != nil {
+			t.Errorf("drop projection failure function: %v", cleanupErr)
+		}
+	})
+}
+
+func postgresTestLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
 func cleanupScopes(t *testing.T, databaseURL string, scopes [][2]string) {
 	t.Helper()
 	t.Cleanup(func() {
@@ -1121,7 +1582,7 @@ func assertDeletedScopeRows(t *testing.T, databaseURL, tenantID, userID string, 
 		t.Fatalf("connect to inspect deletion: %v", err)
 	}
 	defer conn.Close(context.Background())
-	for _, table := range []string{"evidence_events", "memory_candidates", "candidate_source_events", "memory_cards", "memory_embeddings", "memory_identity_chains"} {
+	for _, table := range []string{"evidence_events", "memory_candidates", "candidate_source_events", "memory_cards", "memory_embeddings", "embedding_projection_jobs", "memory_identity_chains"} {
 		var count int
 		query := fmt.Sprintf("SELECT count(*) FROM agent_memory.%s WHERE tenant_id=$1 AND user_id=$2", table)
 		if err := conn.QueryRow(ctx, query, tenantID, userID).Scan(&count); err != nil {
@@ -1159,6 +1620,7 @@ func assertScopeCompletelyAbsent(t *testing.T, databaseURL, tenantID, userID str
 		"candidate_source_events",
 		"memory_cards",
 		"memory_embeddings",
+		"embedding_projection_jobs",
 		"memory_identity_chains",
 		"user_scope_state",
 	} {

@@ -2,7 +2,7 @@
 
 A Go-native, evidence-first memory service for agents. It separates raw conversation evidence, untrusted memory proposals, reviewed/versioned memory cards, and the Context Pack assembled for one request.
 
-> **Current status: durable PostgreSQL vertical slice plus measured lexical and dense retrieval components.** The server binary uses PostgreSQL FTS and is covered by real-process restart and deletion-propagation tests. An independently selectable evaluation arm embeds reviewed cards with a local LM Studio `text-embedding-bge-m3` endpoint and runs exact cosine search through pgvector. Two separately reported 30-case fixtures now provide a 60-case policy gate, a harder prospective synthetic retrieval comparison, and deterministic uncertainty output without presenting the dense evaluator path as the production server.
+> **Current status: durable PostgreSQL vertical slice plus measured lexical and dense retrieval components.** The server binary uses PostgreSQL FTS and is covered by real-process restart and deletion-propagation tests. Approved cards can atomically create content-free embedding projection jobs for registered shadow or serving spaces, but the leased worker, retry loop, backfill, and reconciliation are not implemented yet. An independently selectable evaluation arm embeds reviewed cards with a local LM Studio `text-embedding-bge-m3` endpoint and runs exact cosine search through pgvector. Two separately reported 30-case fixtures provide a 60-case policy gate, a harder prospective synthetic retrieval comparison, and deterministic uncertainty output without presenting the dense evaluator path as the production server.
 
 ## Why this project exists
 
@@ -15,7 +15,9 @@ flowchart LR
     R -->|reject| X[Not serviceable]
     R -->|approve| M[Versioned memory card]
     M --> S[Scoped PostgreSQL FTS server]
-    M -. evaluator projection .-> V[LM Studio + pgvector]
+    M --> O[Transactional projection outbox]
+    O -. worker pending .-> V[LM Studio + pgvector]
+    M -. evaluator-only projection .-> V
     E --> P[Context Pack with sources]
     S --> P
     V -. evaluation arm .-> P
@@ -26,6 +28,7 @@ The implemented invariants are:
 - A candidate is never retrievable before explicit approval.
 - Every candidate references source evidence in the same tenant/user scope.
 - Approval atomically reviews the candidate, supersedes the prior active identity, inserts version `n+1`, and advances the scope revision.
+- When projection targets are enabled, that same approval transaction creates one durable, content-free job per eligible embedding space; rejection creates none.
 - PostgreSQL keys, foreign keys, and queries carry both `tenant_id` and `user_id`.
 - A Context Pack uses one request-time `as_of` value and returns only active, unexpired cards with the source evidence needed to audit them.
 - User erasure transactionally removes evidence, candidates, identity chains, and every card version while retaining a monotonic, content-free revision row.
@@ -38,10 +41,11 @@ The implemented invariants are:
 | Transactional conflict versioning | Concurrent approvals produce v1/v2 with one active card; failure-in-the-middle rolls back | Last-approved-wins, not semantic conflict resolution |
 | Tenant/user isolation | Composite database constraints plus cross-scope tests | Scope headers are selectors, not proof of identity |
 | Restart recovery | Test starts, SIGTERMs, and restarts the actual server binary against one Docker volume | No backup/restore drill yet |
-| Deletion propagation | DELETE commits, PostgreSQL FTS returns nothing, a third server process still sees nothing, and database tables are inspected; pgvector rows cascade with their cards | PostgreSQL backup/PITR deletion policy is not implemented |
+| Deletion propagation | DELETE commits, PostgreSQL FTS returns nothing, a third server process still sees nothing, and database tables are inspected; pgvector rows and pending projection jobs cascade with their cards | PostgreSQL backup/PITR deletion policy is not implemented |
 | Time-based serviceability | Optional absolute `expires_at` is copied from candidate to card; equality is expired and is checked in storage, retrieval, and Context Pack assembly | Expiration does not delete data or change the card's lifecycle status |
 | Offline evaluation | Legacy 8-case smoke fixture plus separate 30-case lifecycle and 30-case semantic-extension datasets; four-arm manifests report quality, deterministic marginal intervals, policy, provenance, latency smoke, and cleanup | Uses authored cards and synthetic queries; the first-look extension is now a regression set and does not measure extraction, concurrent load, answer quality, or production traffic |
-| Dense retrieval component | Versioned card documents, a bounded OpenAI-compatible embeddings client, `vector(1024)` projections, exact scoped cosine search, lifecycle cleanup, and a real-component evaluation arm | Evaluator projects synchronously; the server remains FTS and has no outbox, backfill, reconciliation worker, hybrid fusion, or ANN index |
+| Durable projection handoff | Migration 005 adds immutable-space targets and content-free jobs; approval enqueue, supersession cleanup, erasure cascade, and injected enqueue failure are transaction-tested | No claimant/lease processor, retry loop, backfill, or reconciliation yet; pending jobs are not processed by the server |
+| Dense retrieval component | Versioned card documents, a bounded OpenAI-compatible embeddings client, `vector(1024)` projections, exact scoped cosine search, lifecycle cleanup, and a real-component evaluation arm | Evaluator still projects synchronously; the server remains FTS and has no hybrid fusion or ANN index |
 
 The in-memory adapter remains only for fast unit tests and deterministic offline evaluation. `cmd/server` has no in-memory fallback and fails fast when PostgreSQL is unavailable.
 
@@ -160,6 +164,7 @@ The full HTTP contract is in [`api/openapi.yaml`](api/openapi.yaml).
 ```bash
 make verify             # format, vet, unit tests, race tests, build
 make verify-postgres    # Docker health, migrations, PG/process tests + real FTS policy gate
+make test-outbox-integration # three repeated migration, transaction, restart, and deletion rounds
 make eval               # deterministic lexical smoke evaluation
 make eval-v2            # 30-case no-memory vs reviewed-card BM25 policy gate
 make eval-postgres      # same 30 cases across no-memory, Go BM25, and real PG FTS
@@ -182,7 +187,7 @@ make eval-semantic-recorded
 
 The recorded targets verify that the binary's build revision matches a clean runtime checkout before atomically writing under `artifacts/eval/`. PostgreSQL arms record non-sensitive component metadata. The vector arm additionally records dimension, exact-search strategy, versioned document/query formats, returned model alias, and a fixed-input vector hash. That hash detects observed behavior drift; it is not a model-weights hash. Connection details never enter the manifest, and Make passes URLs through the environment instead of process arguments. Artifacts are ignored by Git by default, so retaining or publishing one is a separate evidence decision.
 
-The versioned lifecycle fixtures are synthetic. The v2 runner executes real application lifecycle calls—including approval, rejection, supersession, expiration, erasure, and cross-scope queries. PostgreSQL arms give each case a random physical tenant/user namespace and prove complete content, vector, and revision-state cleanup. Dense indexing happens only after the reviewed-card transaction commits; the evaluator then calls LM Studio and performs a short active-card-checked projection transaction. A late vector write after supersession or erasure is rejected. This is local component evidence, not production search performance, extraction quality, or a deployed indexing pipeline.
+The versioned lifecycle fixtures are synthetic. The v2 runner executes real application lifecycle calls—including approval, rejection, supersession, expiration, erasure, and cross-scope queries. PostgreSQL arms give each case a random physical tenant/user namespace and prove complete content, vector, projection-job, and revision-state cleanup. Dense indexing happens only after the reviewed-card transaction commits; the evaluator then calls LM Studio and performs a short active-card-checked projection transaction. A late vector write after supersession or erasure is rejected. This is local component evidence, not production search performance, extraction quality, or a deployed indexing pipeline.
 
 On the current 30-case fixture, PostgreSQL FTS reaches Recall@5 `0.6667`, MRR `0.6250`, and nDCG@10 `0.6170`; deterministic Go BM25 reaches `1.0000`, `0.9792`, and `0.9843`; and the local `text-embedding-bge-m3`/pgvector arm reaches `1.0000`, `0.9792`, and `0.9739`. Dense retrieval recovers all eight FTS misses. Every retrieval arm passes all scope, lifecycle, expiration, payload, source-provenance, and cleanup policy checks. The measured dense p50/p95 was about `34.2/42.5 ms` for query embedding plus exact PostgreSQL search on this machine; it is a smoke observation, not an SLA or load benchmark.
 
@@ -212,7 +217,7 @@ compose.yaml                 Local PostgreSQL/pgvector service
 
 ## Roadmap
 
-1. Add a transactional outbox, idempotent embedding worker, backfill, and reconciliation before switching the server to dense or hybrid retrieval.
+1. Add the leased, fenced, idempotent embedding worker plus backfill and reconciliation before switching the server to dense or hybrid retrieval.
 2. Compare reciprocal-rank fusion/reranking against the retained FTS and dense ranking errors; add ANN only after a scale/load benchmark justifies its recall tradeoff.
 3. Add an independently sourced, blinded evaluation cohort and paired comparison before making a model-promotion claim.
 4. Add authenticated principals, authorization, PII policy, rate limits, redacted observability, backup/restore, and backup-aware erasure.

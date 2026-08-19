@@ -26,7 +26,7 @@ EVAL_VECTOR_V2_MANIFEST := $(CURDIR)/artifacts/eval/memory-lifecycle-v2-postgres
 EVAL_SEMANTIC_V1_MANIFEST := $(CURDIR)/artifacts/eval/memory-semantic-extension-v1-postgres-vector-latest.json
 GO_FILES := $(shell find . -path './.cache' -prune -o -path './.git' -prune -o -name '*.go' -type f -print)
 
-.PHONY: build build-eval build-server db-down db-up eval eval-postgres eval-postgres-recorded eval-recorded eval-semantic eval-semantic-recorded eval-v2 eval-vector eval-vector-recorded fmt fmt-check migrate semantic-frozen server test test-integration test-race test-vector-integration verify verify-postgres verify-semantic verify-vector vet
+.PHONY: build build-eval build-server db-down db-up eval eval-postgres eval-postgres-recorded eval-recorded eval-semantic eval-semantic-recorded eval-v2 eval-vector eval-vector-recorded fmt fmt-check migrate semantic-frozen server test test-integration test-outbox-integration test-race test-vector-integration verify verify-postgres verify-semantic verify-vector vet
 
 build:
 	$(GO) build ./...
@@ -86,10 +86,14 @@ test:
 
 test-integration: migrate build-server
 	@TEST_SERVER_BINARY='$(SERVER_BINARY)' \
-		$(GO) test -race -tags=integration -count=1 ./internal/store/postgres ./internal/eval ./cmd/server
+		$(GO) test -p 1 -race -tags=integration -count=1 ./internal/migrations ./internal/store/postgres ./internal/eval ./cmd/server
+
+test-outbox-integration: migrate build-server
+	@TEST_SERVER_BINARY='$(SERVER_BINARY)' \
+		$(GO) test -p 1 -race -tags=integration -count=3 ./internal/migrations ./internal/store/postgres ./cmd/server
 
 test-vector-integration: migrate build-eval
-	@$(GO) test -race -tags='integration vector' -count=1 ./internal/embedding ./internal/store/postgres ./internal/eval
+	@$(GO) test -p 1 -race -tags='integration vector' -count=1 ./internal/embedding ./internal/store/postgres ./internal/eval
 
 test-race:
 	$(GO) test -race ./...

@@ -368,6 +368,18 @@ func (s *Store) ReviewCandidate(ctx context.Context, command domainstore.Candida
 			  AND embedding.memory_id = card.id`, command.TenantID, command.UserID, identityKey); err != nil {
 			return domain.MemoryCandidate{}, nil, mapPostgresError("delete superseded memory embeddings", err)
 		}
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM agent_memory.embedding_projection_jobs AS job
+			USING agent_memory.memory_cards AS card
+			WHERE card.tenant_id = $1
+			  AND card.user_id = $2
+			  AND card.identity_key = $3
+			  AND card.status = 'superseded'
+			  AND job.tenant_id = card.tenant_id
+			  AND job.user_id = card.user_id
+			  AND job.memory_id = card.id`, command.TenantID, command.UserID, identityKey); err != nil {
+			return domain.MemoryCandidate{}, nil, mapProjectionPostgresError("delete superseded memory projection jobs", err)
+		}
 	}
 
 	if _, err := tx.Exec(ctx, `
@@ -384,6 +396,24 @@ func (s *Store) ReviewCandidate(ctx context.Context, command domainstore.Candida
 		card.Relationship, card.Backstory, card.Version, card.CreatedAt, card.ExpiresAt,
 	); err != nil {
 		return domain.MemoryCandidate{}, nil, mapPostgresError("create memory card", err)
+	}
+
+	// Projection targets are registered independently by the embedding worker.
+	// Selecting them inside the approval transaction keeps the lifecycle card
+	// and its durable projection handoff atomic without coupling the Store
+	// interface to one live embedding endpoint. A target registered after this
+	// snapshot is covered by the separate backfill/reconciliation path.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO agent_memory.embedding_projection_jobs (
+			tenant_id, user_id, memory_id, embedding_space, expected_memory_version
+		)
+		SELECT $1, $2, $3, target.embedding_space, $4
+		FROM agent_memory.embedding_projection_targets AS target
+		WHERE target.enqueue_new
+		  AND target.state IN ('shadow', 'serving')`,
+		card.TenantID, card.UserID, card.ID, card.Version,
+	); err != nil {
+		return domain.MemoryCandidate{}, nil, mapProjectionPostgresError("enqueue memory embedding projection", err)
 	}
 
 	commandTag, err = tx.Exec(ctx, `

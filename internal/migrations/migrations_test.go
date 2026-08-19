@@ -22,8 +22,8 @@ func TestEmbeddedMigrationsLoad(t *testing.T) {
 	if err := migrator.LoadMigrations(files); err != nil {
 		t.Fatalf("load migrations: %v", err)
 	}
-	if len(migrator.Migrations) != 4 {
-		t.Fatalf("migration count = %d, want 4", len(migrator.Migrations))
+	if len(migrator.Migrations) != 5 {
+		t.Fatalf("migration count = %d, want 5", len(migrator.Migrations))
 	}
 	if !strings.Contains(migrator.Migrations[0].UpSQL, "CREATE TABLE agent_memory.memory_cards") {
 		t.Fatal("initial migration does not create memory_cards")
@@ -75,6 +75,41 @@ func TestEmbeddedMigrationsLoad(t *testing.T) {
 	}
 	if !strings.Contains(migrator.Migrations[3].DownSQL, "DROP TABLE IF EXISTS agent_memory.memory_embeddings") {
 		t.Fatal("embedding migration does not define its rollback")
+	}
+	if !strings.Contains(migrator.Migrations[4].UpSQL, "CREATE TABLE agent_memory.embedding_projection_targets") {
+		t.Fatal("projection migration does not add the target registry")
+	}
+	if !strings.Contains(migrator.Migrations[4].UpSQL, "state IN ('shadow', 'serving', 'blocked', 'retired')") {
+		t.Fatal("projection target registry does not constrain lifecycle states")
+	}
+	if !strings.Contains(migrator.Migrations[4].UpSQL, "embedding_projection_targets_one_serving_idx") {
+		t.Fatal("projection target registry does not enforce one serving space")
+	}
+	if !strings.Contains(migrator.Migrations[4].UpSQL, "CREATE TABLE agent_memory.embedding_projection_jobs") {
+		t.Fatal("projection migration does not add the durable job outbox")
+	}
+	if !strings.Contains(migrator.Migrations[4].UpSQL, "GENERATED ALWAYS AS IDENTITY PRIMARY KEY") {
+		t.Fatal("projection job outbox does not use a database identity")
+	}
+	if !strings.Contains(migrator.Migrations[4].UpSQL, "state IN ('pending', 'leased', 'retry', 'succeeded', 'dead', 'cancelled')") {
+		t.Fatal("projection job outbox does not constrain lifecycle states")
+	}
+	if !strings.Contains(migrator.Migrations[4].UpSQL, "UNIQUE (tenant_id, user_id, memory_id, embedding_space)") {
+		t.Fatal("projection job outbox does not enforce idempotent natural keys")
+	}
+	if !strings.Contains(migrator.Migrations[4].UpSQL, "embedding_projection_jobs_claim_idx") {
+		t.Fatal("projection job outbox does not define its claim index")
+	}
+	if !strings.Contains(migrator.Migrations[4].UpSQL, "embedding_projection_jobs_lease_until_idx") {
+		t.Fatal("projection job outbox does not define its lease-recovery index")
+	}
+	if strings.Contains(migrator.Migrations[4].UpSQL, "last_error_message") ||
+		strings.Contains(migrator.Migrations[4].UpSQL, "last_error_redacted") {
+		t.Fatal("projection job outbox must persist bounded error codes, not error text")
+	}
+	if !strings.Contains(migrator.Migrations[4].DownSQL, "DROP TABLE IF EXISTS agent_memory.embedding_projection_jobs") ||
+		!strings.Contains(migrator.Migrations[4].DownSQL, "DROP TABLE IF EXISTS agent_memory.embedding_projection_targets") {
+		t.Fatal("projection migration does not define its rollback")
 	}
 }
 

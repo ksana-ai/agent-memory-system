@@ -43,7 +43,7 @@ func (s *Store) DeleteEvaluationScopeState(ctx context.Context, tenantID, userID
 		return mapPostgresError("lock evaluation scope state", err)
 	}
 
-	var evidence, candidates, sources, cards, embeddings, identities int64
+	var evidence, candidates, sources, cards, embeddings, projectionJobs, identities int64
 	err = tx.QueryRow(ctx, `
 		SELECT
 			(SELECT count(*) FROM agent_memory.evidence_events
@@ -56,6 +56,8 @@ func (s *Store) DeleteEvaluationScopeState(ctx context.Context, tenantID, userID
 			 WHERE tenant_id = $1 AND user_id = $2),
 			(SELECT count(*) FROM agent_memory.memory_embeddings
 			 WHERE tenant_id = $1 AND user_id = $2),
+			(SELECT count(*) FROM agent_memory.embedding_projection_jobs
+			 WHERE tenant_id = $1 AND user_id = $2),
 			(SELECT count(*) FROM agent_memory.memory_identity_chains
 			 WHERE tenant_id = $1 AND user_id = $2)`, tenantID, userID).Scan(
 		&evidence,
@@ -63,19 +65,21 @@ func (s *Store) DeleteEvaluationScopeState(ctx context.Context, tenantID, userID
 		&sources,
 		&cards,
 		&embeddings,
+		&projectionJobs,
 		&identities,
 	)
 	if err != nil {
 		return mapPostgresError("inspect evaluation scope contents", err)
 	}
-	if evidence != 0 || candidates != 0 || sources != 0 || cards != 0 || embeddings != 0 || identities != 0 {
+	if evidence != 0 || candidates != 0 || sources != 0 || cards != 0 || embeddings != 0 || projectionJobs != 0 || identities != 0 {
 		return fmt.Errorf(
-			"evaluation scope still contains lifecycle data (evidence=%d candidates=%d sources=%d cards=%d embeddings=%d identities=%d): %w",
+			"evaluation scope still contains lifecycle data (evidence=%d candidates=%d sources=%d cards=%d embeddings=%d projection_jobs=%d identities=%d): %w",
 			evidence,
 			candidates,
 			sources,
 			cards,
 			embeddings,
+			projectionJobs,
 			identities,
 			domain.ErrConflict,
 		)

@@ -33,12 +33,12 @@ func TestPostgresVectorSchemaAndMetadata(t *testing.T) {
 	if metadata.ServerVersionNum == "" || metadata.ExtensionVersion == "" {
 		t.Fatalf("incomplete vector metadata: %#v", metadata)
 	}
-	if metadata.SchemaMigrationVersion != 4 ||
+	if metadata.SchemaMigrationVersion != 5 ||
 		metadata.Dimension != postgres.VectorDimension ||
 		metadata.DistanceMetric != postgres.VectorDistanceMetric ||
 		metadata.SearchStrategy != postgres.VectorSearchStrategy ||
 		metadata.ApproximateIndexCount != 0 {
-		t.Fatalf("vector metadata=%#v, want schema=4 dimension=%d exact cosine", metadata, postgres.VectorDimension)
+		t.Fatalf("vector metadata=%#v, want schema=5 dimension=%d exact cosine", metadata, postgres.VectorDimension)
 	}
 
 	conn, err := pgx.Connect(ctx, databaseURL)

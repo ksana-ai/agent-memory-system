@@ -126,7 +126,7 @@ make eval-semantic-recorded
 
 The deterministic in-memory comparison is level 2. Selecting `reviewed-cards-postgres-fts-v1` adds level-3 PostgreSQL FTS evidence; selecting `reviewed-cards-postgres-vector-v1` adds level-3 LM Studio and pgvector evidence. The preregistered semantic extension adds a synthetic first-look comparison, marginal uncertainty, latency smoke observations, and bad-case analysis, but it is not independently held out and therefore does not by itself satisfy level 4. Both real-component arms still retrieve pre-authored, explicitly approved memory cards. They do not evaluate LLM extraction, evidence verification by a model, long-conversation chunking, reranking, answer generation, token cost, concurrent load, or production traffic.
 
-`make verify-postgres` is level-3 component evidence for migrations, transactions, FTS, restart recovery, and deletion propagation. `make verify-vector` adds real pgvector retrieval and live embedding-endpoint evidence, but the synchronous evaluator projection is not a production indexing pipeline and the server still uses FTS.
+`make verify-postgres` is level-3 component evidence for migrations, transactions, FTS, restart recovery, and deletion propagation. `make verify-vector` adds real pgvector retrieval and live embedding-endpoint evidence. A transactional projection outbox now exists, but without its claimant/lease processor, retry loop, backfill, and reconciliation it is not yet a production indexing pipeline; the evaluator still projects synchronously and the server still uses FTS.
 
 ## Current comparison and next gate
 

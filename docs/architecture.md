@@ -36,7 +36,9 @@ versioned card document ──HTTP──► LM Studio text-embedding-bge-m3
 query ──HTTP embedding───────────────────────┴──► exact pgvector cosine search
 ```
 
-External embedding HTTP calls never run while a PostgreSQL transaction or scope lock is held. The current synchronous projection is evaluator orchestration only. Switching the server to dense or hybrid retrieval requires a transactional outbox, idempotent worker, backfill, and reconciliation path so an embedding outage cannot silently strand production cards.
+External embedding HTTP calls never run while a PostgreSQL transaction or scope lock is held. The current synchronous projection is evaluator orchestration only. Switching the server to dense or hybrid retrieval requires the now-present transactional outbox plus an idempotent worker, backfill, and reconciliation path so an embedding outage cannot silently strand production cards.
+
+Migration 005 implements the first part of that production handoff. An approved card and its content-free `embedding_projection_jobs` rows commit together for every registered target whose state is `shadow` or `serving` and whose `enqueue_new` flag is enabled. The target registry points only to immutable `embedding_spaces` definitions. Jobs retain scope/card/space identifiers, expected memory version, scheduling state, lease-fencing fields, and bounded error codes; they do not retain card text, vectors, endpoint URLs, credentials, response bodies, or raw provider errors. The claimant/lease processor, retry policy, backfill, and reconciliation are still planned, so the presence of the outbox is not evidence that pending jobs are currently processed.
 
 Serviceable means active and either without `expires_at` or with `expires_at` strictly after the request's `as_of` time. The in-memory Store and Go BM25 adapters are retained for unit tests and deterministic comparison only. The server binary has no memory or BM25 fallback.
 
@@ -97,12 +99,13 @@ Candidate approval runs in one transaction:
 2. Revalidate source evidence.
 3. Insert or lock the normalized identity chain.
 4. Compute the next version and a timestamp strictly later than the prior version.
-5. Supersede the current active card, if any, and delete any of its vector projections in the same transaction.
-6. Insert the new active card, including the candidate's optional expiration, and advance the identity chain.
-7. Mark the candidate approved and increment the context revision.
-8. Commit.
+5. Supersede the current active card, if any, and delete any of its vector projections and projection jobs in the same transaction.
+6. Insert the new active card, including the candidate's optional expiration.
+7. Insert one pending projection job per enabled shadow or serving target.
+8. Advance the identity chain, mark the candidate approved, and increment the context revision.
+9. Commit all lifecycle and outbox rows together.
 
-Rejection updates only the candidate and does not advance the retrieval revision. The database adds unique constraints for identity/version and a partial unique index allowing only one active card per identity. Concurrent tests cover two reviewers of one candidate, two candidates for one identity, a failure after superseding but before inserting, and approval racing erasure.
+Rejection updates only the candidate, creates no projection job, and does not advance the retrieval revision. The database adds unique constraints for identity/version and a partial unique index allowing only one active card per identity. Concurrent tests cover two reviewers of one candidate, two candidates for one identity, a failure after superseding but before inserting, approval racing erasure, and an injected projection-job insert failure that rolls the entire approval back.
 
 Vector projection is a separate short transaction after review commits:
 
@@ -114,17 +117,19 @@ Vector projection is a separate short transaction after review commits:
 
 If projection wins first, later supersession or erasure deletes it transactionally. If supersession or erasure wins first, the late active-card check rejects the projection. Concurrent integration tests accept either serialization result and prove that neither leaves a stale projection; direct lifecycle tests also reject a write to an already superseded card.
 
+The direct projection API above remains the evaluator's synchronous component path. The production handoff now stops at the durable pending job. A later worker must claim with `FOR UPDATE SKIP LOCKED`, release all locks before embedding HTTP, then atomically fence the lease, revalidate the active card/version/expiry/space, write the vector, and acknowledge the job. Until those steps and reconciliation are implemented and accepted, the server continues to use FTS.
+
 ## Erasure and read consistency
 
 `ForgetUser` holds the same scope lock and deletes, in one transaction:
 
-1. every active and superseded memory card, cascading any vector projections;
+1. every active and superseded memory card, cascading any vector projections and projection jobs;
 2. identity chains;
 3. pending, rejected, and approved candidates plus source links;
 4. evidence events;
 5. then increments the retained revision and records `last_deleted_at`.
 
-Because the FTS document is a generated column on `memory_cards`, deletion reaches the server retrieval path in the same commit. Dense rows use a scoped composite foreign key with `ON DELETE CASCADE`, and the evaluator proves vector rows are absent before removing its content-free scope tombstone. The process integration test proves FTS data is not returned after the DELETE response and remains absent after another server restart. Other tenant/user scopes are retained as controls.
+Because the FTS document is a generated column on `memory_cards`, deletion reaches the server retrieval path in the same commit. Dense rows and projection jobs use scoped composite foreign keys with `ON DELETE CASCADE`; evaluation cleanup refuses to remove its content-free scope tombstone while either remains. The process integration test proves FTS data is not returned after the DELETE response and remains absent after another server restart. Other tenant/user scopes are retained as controls.
 
 `BuildContext` compares the scope revision before and after its multi-statement retrieval and retries when it observes a concurrent change. This is an optimistic consistency guard, not a single serializable read transaction. The current propagation guarantee applies to requests begun after erasure commits; an HTTP request already in flight at commit is not proven to be a linearizable privacy barrier.
 
@@ -136,7 +141,7 @@ Docker Compose pins `pgvector/pgvector:0.8.6-pg18-bookworm`, binds PostgreSQL to
 
 Versioned SQL is embedded into both `cmd/migrate` and `cmd/server`. Tern applies each migration transactionally and serializes concurrent migrators with an advisory lock. Migrations do not rely on `/docker-entrypoint-initdb.d`, so an existing named volume can be upgraded.
 
-The initial migration installs pgvector. A second migration adds candidate/card expiration and the serviceability lookup index. A third migration adds the generated FTS document and partial GIN index. Migration 004 adds the embedding-space registry, `vector(1024)` projections, composite lifecycle foreign keys, and a scope/space lookup index. It intentionally creates no ANN index: dimension and cosine semantics are tied to the measured endpoint, while approximate indexing remains a later scale decision.
+The initial migration installs pgvector. A second migration adds candidate/card expiration and the serviceability lookup index. A third migration adds the generated FTS document and partial GIN index. Migration 004 adds the embedding-space registry, `vector(1024)` projections, composite lifecycle foreign keys, and a scope/space lookup index. Migration 005 adds the projection-target registry and durable job outbox with one-serving-target, natural-key idempotency, lease-shape, terminal-state, and bounded-error constraints. It intentionally creates no ANN index: dimension and cosine semantics are tied to the measured endpoint, while approximate indexing remains a later scale decision.
 
 ## Trust boundaries
 
