@@ -519,13 +519,20 @@ func TestRunV2DoesNotLetStoreReturnValueDefineExpectedExpiration(t *testing.T) {
     {"op":"query","id":"q","scope":"s","at":"2026-01-01T00:02:00Z","text":"trusted","judgments":{"memory_cards":{"relevance":{"memory":3}}}}
   ]}]
 }`)
+	projectCalls := 0
 	factory := armFactory{
 		descriptor: ArmDescriptor{ID: "corrupt-review-v1", Version: "1", JudgmentProfile: "reviewed-memory-alias-v1", ResultKind: "memory-card", ConfigHash: hashArmConfig("review")},
 		newRuntime: func(context.Context) (ArmRuntime, error) {
 			base := memstore.New()
 			wrapped := corruptReviewStoreV2{Store: base}
 			retriever, err := retrieval.NewBM25(wrapped)
-			return ArmRuntime{Store: wrapped, Retriever: retriever}, err
+			return ArmRuntime{
+				Store: wrapped, Retriever: retriever,
+				ProjectApprovedMemory: func(context.Context, domain.MemoryCard) error {
+					projectCalls++
+					return nil
+				},
+			}, err
 		},
 	}
 	_, err := RunV2(context.Background(), dataset, ConfigV2{
@@ -534,6 +541,49 @@ func TestRunV2DoesNotLetStoreReturnValueDefineExpectedExpiration(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "differs from authored lifecycle") {
 		t.Fatalf("corrupt review return error = %v", err)
+	}
+	if projectCalls != 0 {
+		t.Fatalf("projector calls = %d, want 0 before authored oracle passes", projectCalls)
+	}
+}
+
+func TestRunV2ProjectsOnlyOracleValidatedApprovedMemories(t *testing.T) {
+	dataset := mustLoadDatasetV2(t, `{
+  "schema_version":"2","id":"projection-hook","version":"1","description":"approved projection hook",
+  "cases":[{"id":"projection-case","scopes":[{"id":"s","tenant_id":"tenant","user_id":"user"}],"timeline":[
+    {"op":"memory.remember","memory_ref":"approved","scope":"s","at":"2026-01-01T00:01:00Z","review_state":"approved","memory":{"kind":"semantic","category":"preference","key":"drink","value":"green tea","person":"self","relationship":"self","backstory":"Current drink preference.","expires_at":"2026-02-01T00:00:00Z"},"evidence":[{"alias":"approved-source","session_id":"session","actor":"user","content":"I prefer green tea.","occurred_at":"2026-01-01T00:00:00Z"}]},
+    {"op":"memory.remember","memory_ref":"rejected","scope":"s","at":"2026-01-01T00:03:00Z","review_state":"rejected","memory":{"kind":"semantic","category":"private","key":"guess","value":"unsupported"},"evidence":[{"alias":"rejected-source","session_id":"session","actor":"agent","content":"unsupported guess","occurred_at":"2026-01-01T00:02:00Z"}]},
+    {"op":"memory.remember","memory_ref":"pending","scope":"s","at":"2026-01-01T00:05:00Z","review_state":"pending","memory":{"kind":"semantic","category":"private","key":"pending","value":"unreviewed"},"evidence":[{"alias":"pending-source","session_id":"session","actor":"user","content":"unreviewed statement","occurred_at":"2026-01-01T00:04:00Z"}]},
+    {"op":"query","id":"q","scope":"s","at":"2026-01-01T00:06:00Z","text":"unrelated","judgments":{"memory_cards":{"require_empty":true}}}
+  ]}]
+}`)
+	var projected []domain.MemoryCard
+	factory := armFactory{
+		descriptor: ArmDescriptor{ID: "projection-hook-v1", Version: "1", JudgmentProfile: "reviewed-memory-alias-v1", ResultKind: "memory-card", ConfigHash: hashArmConfig("projection-hook")},
+		newRuntime: func(context.Context) (ArmRuntime, error) {
+			return ArmRuntime{
+				Store: memstore.New(), Retriever: &emptyRetriever{marker: 1},
+				ProjectApprovedMemory: func(_ context.Context, memory domain.MemoryCard) error {
+					projected = append(projected, memory)
+					return nil
+				},
+			}, nil
+		},
+	}
+	if _, err := RunV2(context.Background(), dataset, ConfigV2{
+		RecallK: 1, NDCGK: 1, MeasuredRuns: 1, QueryTimeout: time.Second,
+		Arms: []ArmFactory{factory}, Timer: &stepTimerV2{step: time.Millisecond},
+	}); err != nil {
+		t.Fatalf("RunV2(): %v", err)
+	}
+	if len(projected) != 1 {
+		t.Fatalf("projected memories = %d, want only the approved fixture", len(projected))
+	}
+	memory := projected[0]
+	if memory.ID != stableArtifactIDV2("mem", "projection-case", "approved") ||
+		memory.TenantID != "tenant" || memory.UserID != "user" || memory.Status != domain.MemoryActive ||
+		memory.Value != "green tea" || memory.ExpiresAt == nil || !memory.ExpiresAt.Equal(time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("projector did not receive the authored oracle card: %#v", memory)
 	}
 }
 

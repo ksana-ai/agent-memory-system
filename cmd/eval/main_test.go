@@ -14,21 +14,24 @@ import (
 )
 
 func TestSelectArmFactoriesSortsAndRejectsInvalidIDs(t *testing.T) {
-	factories, err := selectArmFactories(context.Background(), "reviewed-cards-bm25-v1,no-memory-v1", "")
+	factories, err := selectArmFactories(context.Background(), "reviewed-cards-bm25-v1,no-memory-v1", "", "", "")
 	if err != nil {
 		t.Fatalf("select arms: %v", err)
 	}
 	if got := factories[0].Descriptor().ID; got != "no-memory-v1" {
 		t.Fatalf("first arm = %q, want no-memory-v1", got)
 	}
-	if _, err := selectArmFactories(context.Background(), "no-memory-v1,no-memory-v1", ""); err == nil {
+	if _, err := selectArmFactories(context.Background(), "no-memory-v1,no-memory-v1", "", "", ""); err == nil {
 		t.Fatal("duplicate arm was accepted")
 	}
-	if _, err := selectArmFactories(context.Background(), "unknown", ""); err == nil {
+	if _, err := selectArmFactories(context.Background(), "unknown", "", "", ""); err == nil {
 		t.Fatal("unknown arm was accepted")
 	}
-	if _, err := selectArmFactories(context.Background(), "reviewed-cards-postgres-fts-v1", ""); err == nil {
+	if _, err := selectArmFactories(context.Background(), "reviewed-cards-postgres-fts-v1", "", "", ""); err == nil {
 		t.Fatal("PostgreSQL arm without URL was accepted")
+	}
+	if _, err := selectArmFactories(context.Background(), "reviewed-cards-postgres-vector-v1", "postgres://database", "", "text-embedding-bge-m3"); err == nil {
+		t.Fatal("PostgreSQL vector arm without embedding URL was accepted")
 	}
 }
 
@@ -57,6 +60,18 @@ func TestPostgresURLFlagIsNotAccepted(t *testing.T) {
 	}
 }
 
+func TestEmbeddingEndpointFlagIsNotAccepted(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := run(context.Background(), []string{"-embeddings-url=http://example.invalid/raw-flag-secret"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
+		t.Fatalf("removed embedding endpoint flag error = %v", err)
+	}
+	if strings.Contains(err.Error(), "raw-flag-secret") || strings.Contains(stderr.String(), "raw-flag-secret") {
+		t.Fatalf("removed embedding endpoint flag leaked its value: error=%q stderr=%q", err, stderr.String())
+	}
+}
+
 func TestEvalPostgresDryRunDoesNotPutDatabaseURLInCommand(t *testing.T) {
 	const secretURL = "postgres://eval-user:make-dry-run-secret@db.example.invalid/agent_memory"
 	for _, target := range []string{"eval-postgres", "eval-postgres-recorded"} {
@@ -71,6 +86,31 @@ func TestEvalPostgresDryRunDoesNotPutDatabaseURLInCommand(t *testing.T) {
 		}
 		if strings.Contains(string(output), "-postgres-url") {
 			t.Fatalf("%s passed the database URL through argv: %s", target, output)
+		}
+	}
+}
+
+func TestEvalVectorDryRunDoesNotPutConnectionsInCommand(t *testing.T) {
+	const databaseURL = "postgres://eval-user:vector-database-secret@db.example.invalid/agent_memory"
+	const embeddingsURL = "http://127.0.0.1:1234/v1/embeddings/vector-endpoint-secret"
+	for _, target := range []string{"eval-vector", "eval-vector-recorded", "verify-vector"} {
+		command := exec.Command(
+			"make", "-n", target,
+			"TEST_DATABASE_URL="+databaseURL,
+			"LMSTUDIO_EMBEDDINGS_URL="+embeddingsURL,
+		)
+		command.Dir = filepath.Join("..", "..")
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("make -n %s: %v\n%s", target, err, output)
+		}
+		for _, secret := range []string{databaseURL, "vector-database-secret", embeddingsURL, "vector-endpoint-secret"} {
+			if strings.Contains(string(output), secret) {
+				t.Fatalf("%s command leaked connection configuration: %s", target, output)
+			}
+		}
+		if strings.Contains(string(output), "-postgres-url") || strings.Contains(string(output), "-embeddings-url") {
+			t.Fatalf("%s passed a connection through argv: %s", target, output)
 		}
 	}
 }

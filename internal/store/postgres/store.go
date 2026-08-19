@@ -355,6 +355,20 @@ func (s *Store) ReviewCandidate(ctx context.Context, command domainstore.Candida
 			identityKey, commandTag.RowsAffected(), expectedSuperseded, domain.ErrInvariant,
 		)
 	}
+	if expectedSuperseded == 1 {
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM agent_memory.memory_embeddings AS embedding
+			USING agent_memory.memory_cards AS card
+			WHERE card.tenant_id = $1
+			  AND card.user_id = $2
+			  AND card.identity_key = $3
+			  AND card.status = 'superseded'
+			  AND embedding.tenant_id = card.tenant_id
+			  AND embedding.user_id = card.user_id
+			  AND embedding.memory_id = card.id`, command.TenantID, command.UserID, identityKey); err != nil {
+			return domain.MemoryCandidate{}, nil, mapPostgresError("delete superseded memory embeddings", err)
+		}
+	}
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO agent_memory.memory_cards (

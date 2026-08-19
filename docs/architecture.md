@@ -22,6 +22,22 @@ Store port ──────────────► PostgreSQL adapter / FT
 
 The server uses PostgreSQL full-text search directly. Migration 003 adds a STORED generated `tsvector`: memory key has weight A, value B, category/person/relationship C, and backstory D. A partial GIN index covers active cards. Plain query text is tokenized with the fixed `simple` configuration; the resulting lexemes are safely quoted and OR-combined before `ts_rank_cd` ranking. Scope, active status, and expiration are filtered in the same SQL statement, followed by deterministic `created_at`/ID tie-breaking.
 
+Dense retrieval is an independently selectable evaluator component, not the server path:
+
+```text
+review transaction commits
+          │
+          ▼
+versioned card document ──HTTP──► LM Studio text-embedding-bge-m3
+          │                                  │
+          │                                  ▼
+          └──────── short projection tx ◄── vector(1024)
+                                             │
+query ──HTTP embedding───────────────────────┴──► exact pgvector cosine search
+```
+
+External embedding HTTP calls never run while a PostgreSQL transaction or scope lock is held. The current synchronous projection is evaluator orchestration only. Switching the server to dense or hybrid retrieval requires a transactional outbox, idempotent worker, backfill, and reconciliation path so an embedding outage cannot silently strand production cards.
+
 Serviceable means active and either without `expires_at` or with `expires_at` strictly after the request's `as_of` time. The in-memory Store and Go BM25 adapters are retained for unit tests and deterministic comparison only. The server binary has no memory or BM25 fallback.
 
 ## Data layers
@@ -56,6 +72,14 @@ Approving another candidate with the same identity supersedes the active version
 
 A Context Pack is a request-scoped projection, not another persistent memory type. It captures one `as_of` value for retries, retrieval filtering, a final fail-closed serviceability check, and `generated_at`. It contains ranked serviceable cards and their ordered source evidence. The calling agent remains responsible for prompt ordering, token budgets, truncation, and instruction/data separation.
 
+### Dense projection
+
+Migration 004 adds an `embedding_spaces` registry and tenant/user-scoped `memory_embeddings`. Each embedding row has a composite foreign key to its memory card and repeats the provider, model, document version, query version, and behavioral fingerprint covered by the space registry. That prevents vectors produced under incompatible semantics from sharing a search space.
+
+The versioned document contains only `{kind, category, key, value, person, relationship, backstory}` in a fixed escaped field order. Scope, identifiers, lifecycle state, source IDs, and timestamps remain filters or provenance rather than semantic text. Queries use the service-trimmed text without an added prompt. A fixed public probe vector is hashed using big-endian IEEE 754 float32 bytes and included in the arm configuration. It detects observed endpoint behavior drift but is not a model-weights hash.
+
+The baseline uses exact cosine ordering through pgvector's `<=>` operator. Tenant, user, embedding space, active state, and expiration are filtered in the same ranking SQL. There is deliberately no HNSW or IVFFlat index in this phase, so approximate-index recall is not mixed into the model comparison.
+
 ## Transaction and lock model
 
 `agent_memory.user_scope_state` is both a persistent context revision and the first lock acquired by every write for `(tenant_id, user_id)`. The row survives erasure, preventing revision ABA after the user later creates new data.
@@ -73,28 +97,38 @@ Candidate approval runs in one transaction:
 2. Revalidate source evidence.
 3. Insert or lock the normalized identity chain.
 4. Compute the next version and a timestamp strictly later than the prior version.
-5. Supersede the current active card, if any.
+5. Supersede the current active card, if any, and delete any of its vector projections in the same transaction.
 6. Insert the new active card, including the candidate's optional expiration, and advance the identity chain.
 7. Mark the candidate approved and increment the context revision.
 8. Commit.
 
 Rejection updates only the candidate and does not advance the retrieval revision. The database adds unique constraints for identity/version and a partial unique index allowing only one active card per identity. Concurrent tests cover two reviewers of one candidate, two candidates for one identity, a failure after superseding but before inserting, and approval racing erasure.
 
+Vector projection is a separate short transaction after review commits:
+
+1. Lock the existing scope row, serializing with erasure without recreating a deleted scope.
+2. Require the target card to still be active.
+3. Validate or create the immutable embedding-space registry entry.
+4. Insert or update the card vector and advance the context revision only for a real projection change.
+5. Commit before the projection becomes searchable.
+
+If projection wins first, later supersession or erasure deletes it transactionally. If supersession or erasure wins first, the late active-card check rejects the projection. Concurrent integration tests accept either serialization result and prove that neither leaves a stale projection; direct lifecycle tests also reject a write to an already superseded card.
+
 ## Erasure and read consistency
 
 `ForgetUser` holds the same scope lock and deletes, in one transaction:
 
-1. every active and superseded memory card;
+1. every active and superseded memory card, cascading any vector projections;
 2. identity chains;
 3. pending, rejected, and approved candidates plus source links;
 4. evidence events;
 5. then increments the retained revision and records `last_deleted_at`.
 
-Because the FTS document is a generated column on `memory_cards`, deletion reaches the current retrieval path in the same commit; there is no asynchronous search projection to lag. The process integration test proves data is not returned after the DELETE response and remains absent after another server restart. Other tenant/user scopes are retained as controls.
+Because the FTS document is a generated column on `memory_cards`, deletion reaches the server retrieval path in the same commit. Dense rows use a scoped composite foreign key with `ON DELETE CASCADE`, and the evaluator proves vector rows are absent before removing its content-free scope tombstone. The process integration test proves FTS data is not returned after the DELETE response and remains absent after another server restart. Other tenant/user scopes are retained as controls.
 
 `BuildContext` compares the scope revision before and after its multi-statement retrieval and retries when it observes a concurrent change. This is an optimistic consistency guard, not a single serializable read transaction. The current propagation guarantee applies to requests begun after erasure commits; an HTTP request already in flight at commit is not proven to be a linearizable privacy barrier.
 
-No external vector index exists yet, so this phase cannot claim distributed index deletion. PostgreSQL backups and point-in-time recovery retention also need a separate erasure policy before production use.
+There is no external vector index, so the current deletion claim covers the primary PostgreSQL database only. PostgreSQL backups and point-in-time recovery retention still need a separate erasure policy before production use.
 
 ## Migrations and runtime
 
@@ -102,7 +136,7 @@ Docker Compose pins `pgvector/pgvector:0.8.6-pg18-bookworm`, binds PostgreSQL to
 
 Versioned SQL is embedded into both `cmd/migrate` and `cmd/server`. Tern applies each migration transactionally and serializes concurrent migrators with an advisory lock. Migrations do not rely on `/docker-entrypoint-initdb.d`, so an existing named volume can be upgraded.
 
-The initial migration installs pgvector but intentionally creates no embedding column or ANN index. A second migration adds candidate/card expiration and the serviceability lookup index. A third migration adds the generated FTS document and partial GIN index. Vector dimensions and distance semantics must follow a measured embedding endpoint, not precede one.
+The initial migration installs pgvector. A second migration adds candidate/card expiration and the serviceability lookup index. A third migration adds the generated FTS document and partial GIN index. Migration 004 adds the embedding-space registry, `vector(1024)` projections, composite lifecycle foreign keys, and a scope/space lookup index. It intentionally creates no ANN index: dimension and cosine semantics are tied to the measured endpoint, while approximate indexing remains a later scale decision.
 
 ## Trust boundaries
 
@@ -112,3 +146,5 @@ The initial migration installs pgvector but intentionally creates no embedding c
 - Database constraints and scoped SQL are the enforcement layer; prompt instructions are not a security boundary.
 - `/healthz` proves only that the process is alive. `/readyz` separately pings PostgreSQL.
 - Retrieval scores are lexical ranking values, not truth confidence. The fixed `simple` configuration is a reproducible baseline, not language-aware semantic retrieval; the lifecycle fixture already exposes paraphrase and multilingual misses.
+- Memory-card and query text leave the process when the dense evaluator calls its configured LM Studio endpoint. The client accepts only absolute HTTP(S) URLs without userinfo/query/fragment, follows no redirects, enforces timeout/input/batch/response limits, validates model/index/dimension/finite nonzero vectors, performs no retry, and does not expose input, response bodies, or endpoints in errors or manifests. Plain HTTP is intended only for the trusted loopback development endpoint; any future remote endpoint must use HTTPS and needs an explicit authentication/secrets design.
+- Cosine similarity is relevance ranking, not truth confidence. The vector arm is local component evidence over authored reviewed cards, not proof of extraction quality or production behavior.

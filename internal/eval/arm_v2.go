@@ -38,9 +38,10 @@ type ArmDescriptor struct {
 // shares it across a case or arm, which makes evaluation order irrelevant and
 // prevents fixture state leaking between cases.
 type ArmRuntime struct {
-	Store     store.Store
-	Retriever app.Retriever
-	Cleanup   func(context.Context) error
+	Store                 store.Store
+	Retriever             app.Retriever
+	ProjectApprovedMemory func(context.Context, domain.MemoryCard) error
+	Cleanup               func(context.Context) error
 }
 
 // ArmFactory constructs an isolated retrieval runtime for a single case.

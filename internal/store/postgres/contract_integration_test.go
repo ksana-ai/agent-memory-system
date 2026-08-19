@@ -1121,7 +1121,7 @@ func assertDeletedScopeRows(t *testing.T, databaseURL, tenantID, userID string, 
 		t.Fatalf("connect to inspect deletion: %v", err)
 	}
 	defer conn.Close(context.Background())
-	for _, table := range []string{"evidence_events", "memory_candidates", "candidate_source_events", "memory_cards", "memory_identity_chains"} {
+	for _, table := range []string{"evidence_events", "memory_candidates", "candidate_source_events", "memory_cards", "memory_embeddings", "memory_identity_chains"} {
 		var count int
 		query := fmt.Sprintf("SELECT count(*) FROM agent_memory.%s WHERE tenant_id=$1 AND user_id=$2", table)
 		if err := conn.QueryRow(ctx, query, tenantID, userID).Scan(&count); err != nil {
@@ -1158,6 +1158,7 @@ func assertScopeCompletelyAbsent(t *testing.T, databaseURL, tenantID, userID str
 		"memory_candidates",
 		"candidate_source_events",
 		"memory_cards",
+		"memory_embeddings",
 		"memory_identity_chains",
 		"user_scope_state",
 	} {

@@ -45,6 +45,8 @@ func run(ctx context.Context, arguments []string, stdout, stderr io.Writer) erro
 		return fmt.Errorf("unexpected positional arguments: %s", strings.Join(flags.Args(), " "))
 	}
 	postgresURL := os.Getenv("TEST_DATABASE_URL")
+	embeddingsURL := os.Getenv("LMSTUDIO_EMBEDDINGS_URL")
+	embeddingModel := os.Getenv("LMSTUDIO_EMBEDDING_MODEL")
 
 	data, err := os.ReadFile(*datasetPath)
 	if err != nil {
@@ -71,7 +73,7 @@ func run(ctx context.Context, arguments []string, stdout, stderr io.Writer) erro
 		if loadErr != nil {
 			return fmt.Errorf("load v2 dataset: %w", loadErr)
 		}
-		arms, armErr := selectArmFactories(ctx, *armIDs, postgresURL)
+		arms, armErr := selectArmFactories(ctx, *armIDs, postgresURL, embeddingsURL, embeddingModel)
 		if armErr != nil {
 			return armErr
 		}
@@ -162,7 +164,7 @@ func detectDatasetSchema(data []byte) (string, error) {
 	return envelope.SchemaVersion, nil
 }
 
-func selectArmFactories(ctx context.Context, value, postgresURL string) ([]memoryeval.ArmFactory, error) {
+func selectArmFactories(ctx context.Context, value, postgresURL, embeddingsURL, embeddingModel string) ([]memoryeval.ArmFactory, error) {
 	if strings.TrimSpace(value) == "" {
 		return memoryeval.BuiltinArmFactories(), nil
 	}
@@ -180,6 +182,8 @@ func selectArmFactories(ctx context.Context, value, postgresURL string) ([]memor
 		var err error
 		if id == memoryeval.ArmReviewedCardsPostgresFTSV1 {
 			factory, err = memoryeval.NewPostgresFTSArmFactory(ctx, postgresURL)
+		} else if id == memoryeval.ArmReviewedCardsPostgresVectorV1 {
+			factory, err = memoryeval.NewPostgresVectorArmFactory(ctx, postgresURL, embeddingsURL, embeddingModel)
 		} else {
 			factory, err = memoryeval.BuiltinArmFactory(id)
 		}

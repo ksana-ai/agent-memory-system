@@ -120,21 +120,22 @@ func validateConfigV2(config ConfigV2) error {
 }
 
 type caseRuntimeV2 struct {
-	testCase          CaseV2
-	service           *app.Service
-	timed             *timedRetrieverV2
-	logicalNow        time.Time
-	scopes            map[string]ScopeV2
-	evidenceIDs       map[string]string
-	evidenceAliases   map[string]string
-	evidenceExpected  map[string]domain.EvidenceEvent
-	candidateIDs      map[string]string
-	candidateSources  map[string][]string
-	candidateExpected map[string]domain.MemoryCandidate
-	memoryIDs         map[string]string
-	memoryAliases     map[string]string
-	memoryState       map[string]*logicalMemoryV2
-	nextIDAlias       string
+	testCase              CaseV2
+	service               *app.Service
+	timed                 *timedRetrieverV2
+	logicalNow            time.Time
+	scopes                map[string]ScopeV2
+	evidenceIDs           map[string]string
+	evidenceAliases       map[string]string
+	evidenceExpected      map[string]domain.EvidenceEvent
+	candidateIDs          map[string]string
+	candidateSources      map[string][]string
+	candidateExpected     map[string]domain.MemoryCandidate
+	memoryIDs             map[string]string
+	memoryAliases         map[string]string
+	memoryState           map[string]*logicalMemoryV2
+	projectApprovedMemory func(context.Context, domain.MemoryCard) error
+	nextIDAlias           string
 }
 
 type logicalMemoryV2 struct {
@@ -157,18 +158,19 @@ func runCaseV2(ctx context.Context, testCase CaseV2, factory ArmFactory, config 
 	}
 	timed := &timedRetrieverV2{inner: runtime.Retriever, timer: config.Timer}
 	state := &caseRuntimeV2{
-		testCase:          testCase,
-		timed:             timed,
-		scopes:            make(map[string]ScopeV2, len(testCase.Scopes)),
-		evidenceIDs:       make(map[string]string),
-		evidenceAliases:   make(map[string]string),
-		evidenceExpected:  make(map[string]domain.EvidenceEvent),
-		candidateIDs:      make(map[string]string),
-		candidateSources:  make(map[string][]string),
-		candidateExpected: make(map[string]domain.MemoryCandidate),
-		memoryIDs:         make(map[string]string),
-		memoryAliases:     make(map[string]string),
-		memoryState:       make(map[string]*logicalMemoryV2),
+		testCase:              testCase,
+		timed:                 timed,
+		scopes:                make(map[string]ScopeV2, len(testCase.Scopes)),
+		evidenceIDs:           make(map[string]string),
+		evidenceAliases:       make(map[string]string),
+		evidenceExpected:      make(map[string]domain.EvidenceEvent),
+		candidateIDs:          make(map[string]string),
+		candidateSources:      make(map[string][]string),
+		candidateExpected:     make(map[string]domain.MemoryCandidate),
+		memoryIDs:             make(map[string]string),
+		memoryAliases:         make(map[string]string),
+		memoryState:           make(map[string]*logicalMemoryV2),
+		projectApprovedMemory: runtime.ProjectApprovedMemory,
 	}
 	for _, scope := range testCase.Scopes {
 		state.scopes[scope.ID] = scope
@@ -307,6 +309,11 @@ func (state *caseRuntimeV2) reviewCandidate(ctx context.Context, candidateAlias,
 	expectedCard := state.expectedApprovedMemoryV2(memoryAlias, scopeID, expectedCandidate)
 	if !memoryCardsEqualV2(*card, expectedCard) {
 		return fmt.Errorf("approved memory %q differs from authored lifecycle", memoryAlias)
+	}
+	if state.projectApprovedMemory != nil {
+		if err := state.projectApprovedMemory(ctx, cloneMemoryCardV2(expectedCard)); err != nil {
+			return fmt.Errorf("project approved memory %q: %w", memoryAlias, err)
+		}
 	}
 	state.registerMemory(memoryAlias, scopeID, state.candidateSources[candidateAlias], expectedCard)
 	return nil
@@ -785,6 +792,13 @@ func cloneOptionalTimeV2(value *time.Time) *time.Time {
 	}
 	cloned := *value
 	return &cloned
+}
+
+func cloneMemoryCardV2(value domain.MemoryCard) domain.MemoryCard {
+	value.SourceEventIDs = append([]string(nil), value.SourceEventIDs...)
+	value.ExpiresAt = cloneOptionalTimeV2(value.ExpiresAt)
+	value.SupersededAt = cloneOptionalTimeV2(value.SupersededAt)
+	return value
 }
 
 func equalOptionalTimeV2(left, right *time.Time) bool {
