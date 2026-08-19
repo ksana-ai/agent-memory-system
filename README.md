@@ -2,7 +2,7 @@
 
 A Go-native, evidence-first memory service for agents. It separates raw conversation evidence, untrusted memory proposals, reviewed/versioned memory cards, and the Context Pack assembled for one request.
 
-> **Current status: durable PostgreSQL vertical slice.** The server binary uses PostgreSQL started by Docker Compose, applies embedded transactional migrations, and has real-process restart and deletion-propagation tests. Retrieval is still deterministic BM25 over active PostgreSQL cards. The pgvector extension is installed for the next retrieval phase, but embeddings and vector search are not implemented.
+> **Current status: durable PostgreSQL vertical slice plus deterministic retrieval gate.** The server binary uses PostgreSQL started by Docker Compose, applies embedded transactional migrations, and has real-process restart and deletion-propagation tests. Retrieval is still deterministic BM25 over active PostgreSQL cards. A 28-case lifecycle benchmark compares no-memory and reviewed-card BM25 arms. The pgvector extension is installed for the next retrieval phase, but embeddings and vector search are not implemented.
 
 ## Why this project exists
 
@@ -37,7 +37,7 @@ The implemented invariants are:
 | Tenant/user isolation | Composite database constraints plus cross-scope tests | Scope headers are selectors, not proof of identity |
 | Restart recovery | Test starts, SIGTERMs, and restarts the actual server binary against one Docker volume | No backup/restore drill yet |
 | Deletion propagation | DELETE commits, BM25 returns nothing, a third server process still sees nothing, and database tables are inspected | Covers PostgreSQL and the live BM25 path; there is no external vector index or backup deletion policy |
-| Offline evaluation | Versioned 8-case synthetic dataset, SHA-256, ranks, Recall@K, and MRR | Uses the in-memory adapter for determinism; not a production benchmark |
+| Offline evaluation | Legacy 8-case smoke fixture plus a strict 28-case lifecycle dataset; multi-arm manifests report Recall@K, MRR, nDCG, policy failures, source invariants, and smoke timing | Uses authored cards and the in-memory adapter; it does not measure extraction, PostgreSQL retrieval, embeddings, load, or production traffic |
 | pgvector | Docker image and migration create extension `vector` | No vector column, embedding model, ANN index, or vector query yet |
 
 The in-memory adapter remains only for fast unit tests and deterministic offline evaluation. `cmd/server` has no in-memory fallback and fails fast when PostgreSQL is unavailable.
@@ -48,6 +48,8 @@ Requirements:
 
 - Go 1.25+
 - Docker Engine with Docker Compose
+
+Make invokes Go with `GOSUMDB=$(GO_CHECKSUM_DB)` and defaults `GO_CHECKSUM_DB` to `sum.golang.org`, so an auto-downloaded Go toolchain is checksum-verified even when the surrounding shell disables the checksum database. Environments using an approved checksum mirror can override that project variable.
 
 Start PostgreSQL, apply the same embedded migration used by the server, and run all Docker-backed integration tests:
 
@@ -152,20 +154,20 @@ The full HTTP contract is in [`api/openapi.yaml`](api/openapi.yaml).
 make verify             # format, vet, unit tests, race tests, build
 make verify-postgres    # Docker health, migration, PG contract + process tests
 make eval               # deterministic lexical smoke evaluation
+make eval-v2            # 28-case no-memory vs reviewed-card BM25 policy gate
 ```
 
 The PostgreSQL test tag is intentionally strict: invoking it directly without `TEST_DATABASE_URL`, or invoking the process test without `TEST_SERVER_BINARY`, fails instead of silently skipping.
 
-To retain a local machine-readable evaluation run:
+To retain a machine-readable v2 run from a clean committed revision:
 
 ```bash
-./bin/agent-memory-eval \
-  -dataset ./datasets/retrieval-smoke-v1.json \
-  -k 5 \
-  -output ./artifacts/eval/latest.json
+make eval-recorded
 ```
 
-The fixture is deliberately small and synthetic. A perfect score proves metric and retrieval plumbing on that fixture, not production retrieval quality.
+`eval-recorded` verifies that the binary's build revision matches a clean runtime checkout before atomically writing `artifacts/eval/memory-lifecycle-v2-latest.json`. The artifact is ignored by Git by default; retaining or publishing it is a separate evidence decision.
+
+Both fixtures are synthetic. The v2 runner executes real application lifecycle calls—including approval, rejection, supersession, erasure, and cross-scope queries—but uses the in-memory Store for deterministic comparison. It therefore proves the fixture lifecycle and retrieval-policy behavior, not PostgreSQL search performance, embedding quality, LLM extraction, or production retrieval quality.
 
 See [`docs/architecture.md`](docs/architecture.md) for transaction boundaries and [`docs/evaluation.md`](docs/evaluation.md) for metric semantics and evidence levels.
 
@@ -190,8 +192,8 @@ compose.yaml                 Local PostgreSQL/pgvector service
 
 ## Roadmap
 
-1. Grow the evaluation gate toward roughly 60 multi-session hard cases and retain clean-revision manifests.
-2. Add PostgreSQL full-text search and one real embedding/pgvector retrieval arm, then compare them on the same dataset.
+1. Add real time-based serviceability semantics and the two deferred expiration cases, then grow the 30-case gate toward roughly 60 held-out multi-session cases.
+2. Add PostgreSQL full-text search and one real `text-embedding-bge-m3`/pgvector retrieval arm, then compare them on the same dataset.
 3. Add reciprocal-rank fusion/reranking only if the measured baseline justifies it.
 4. Add authenticated principals, authorization, PII policy, rate limits, redacted observability, backup/restore, and backup-aware erasure.
 5. Add a structured model extractor and verifier with explicit human-escalation policy.

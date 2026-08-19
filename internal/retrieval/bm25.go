@@ -73,11 +73,17 @@ func (retriever *BM25) Search(ctx context.Context, tenantID, userID, query strin
 	for _, token := range queryTokens {
 		queryFrequency[token]++
 	}
+	queryTerms := make([]string, 0, len(queryFrequency))
+	for token := range queryFrequency {
+		queryTerms = append(queryTerms, token)
+	}
+	sort.Strings(queryTerms)
 
 	hits := make([]domain.SearchHit, 0, len(documents))
 	for _, document := range documents {
 		score := 0.0
-		for token, queryCount := range queryFrequency {
+		for _, token := range queryTerms {
+			queryCount := queryFrequency[token]
 			termCount := document.terms[token]
 			if termCount == 0 {
 				continue
@@ -93,7 +99,7 @@ func (retriever *BM25) Search(ctx context.Context, tenantID, userID, query strin
 	}
 
 	sort.Slice(hits, func(i, j int) bool {
-		if math.Abs(hits[i].Score-hits[j].Score) > 1e-12 {
+		if hits[i].Score != hits[j].Score {
 			return hits[i].Score > hits[j].Score
 		}
 		if !hits[i].Memory.CreatedAt.Equal(hits[j].Memory.CreatedAt) {
