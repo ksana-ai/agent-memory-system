@@ -22,8 +22,8 @@ func TestEmbeddedMigrationsLoad(t *testing.T) {
 	if err := migrator.LoadMigrations(files); err != nil {
 		t.Fatalf("load migrations: %v", err)
 	}
-	if len(migrator.Migrations) != 5 {
-		t.Fatalf("migration count = %d, want 5", len(migrator.Migrations))
+	if len(migrator.Migrations) != 6 {
+		t.Fatalf("migration count = %d, want 6", len(migrator.Migrations))
 	}
 	if !strings.Contains(migrator.Migrations[0].UpSQL, "CREATE TABLE agent_memory.memory_cards") {
 		t.Fatal("initial migration does not create memory_cards")
@@ -110,6 +110,41 @@ func TestEmbeddedMigrationsLoad(t *testing.T) {
 	if !strings.Contains(migrator.Migrations[4].DownSQL, "DROP TABLE IF EXISTS agent_memory.embedding_projection_jobs") ||
 		!strings.Contains(migrator.Migrations[4].DownSQL, "DROP TABLE IF EXISTS agent_memory.embedding_projection_targets") {
 		t.Fatal("projection migration does not define its rollback")
+	}
+	if !strings.Contains(migrator.Migrations[5].UpSQL, "CREATE TABLE agent_memory.embedding_projection_deployment") {
+		t.Fatal("deployment migration does not add its singleton state")
+	}
+	if !strings.Contains(migrator.Migrations[5].UpSQL, "singleton boolean PRIMARY KEY DEFAULT true") ||
+		!strings.Contains(migrator.Migrations[5].UpSQL, "CHECK (singleton)") {
+		t.Fatal("deployment state does not enforce its singleton key")
+	}
+	if !strings.Contains(migrator.Migrations[5].UpSQL, "generation bigint NOT NULL DEFAULT 0") ||
+		!strings.Contains(migrator.Migrations[5].UpSQL, "CHECK (generation >= 0)") {
+		t.Fatal("deployment state does not enforce a nonnegative generation")
+	}
+	if !strings.Contains(migrator.Migrations[5].UpSQL, "updated_at timestamptz NOT NULL DEFAULT clock_timestamp()") {
+		t.Fatal("deployment state does not use the database clock")
+	}
+	if !strings.Contains(migrator.Migrations[5].UpSQL, "CHECK (updated_at >= created_at)") {
+		t.Fatal("deployment state does not constrain its timestamps")
+	}
+	if !strings.Contains(migrator.Migrations[5].UpSQL, "INSERT INTO agent_memory.embedding_projection_deployment DEFAULT VALUES") {
+		t.Fatal("deployment migration does not seed its one lock row")
+	}
+	for _, index := range []string{
+		"memory_cards_active_projection_scan_idx",
+		"embedding_projection_jobs_space_scope_memory_idx",
+		"memory_embeddings_space_scope_memory_idx",
+	} {
+		if !strings.Contains(migrator.Migrations[5].UpSQL, index) {
+			t.Fatalf("deployment migration does not add reconciliation index %s", index)
+		}
+		if !strings.Contains(migrator.Migrations[5].DownSQL, "DROP INDEX IF EXISTS agent_memory."+index) {
+			t.Fatalf("deployment migration does not roll back reconciliation index %s", index)
+		}
+	}
+	if !strings.Contains(migrator.Migrations[5].DownSQL, "DROP TABLE IF EXISTS agent_memory.embedding_projection_deployment") {
+		t.Fatal("deployment migration does not define its rollback")
 	}
 }
 

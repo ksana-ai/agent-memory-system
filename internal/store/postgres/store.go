@@ -233,6 +233,15 @@ func (s *Store) ReviewCandidate(ctx context.Context, command domainstore.Candida
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 
+	// Approval freezes the deployment before taking any narrower lock. Target
+	// registration and updates take the conflicting deployment lock first, so
+	// an approval observes either the complete old deployment or the complete
+	// new deployment. Rejection never reads or changes projection deployment.
+	if command.Review.Decision == domain.DecisionApprove {
+		if _, err := lockProjectionDeploymentShared(ctx, tx); err != nil {
+			return domain.MemoryCandidate{}, nil, err
+		}
+	}
 	if err := lockScope(ctx, tx, command.TenantID, command.UserID); err != nil {
 		return domain.MemoryCandidate{}, nil, err
 	}
@@ -265,10 +274,9 @@ func (s *Store) ReviewCandidate(ctx context.Context, command domainstore.Candida
 	default:
 		return domain.MemoryCandidate{}, nil, fmt.Errorf("review decision %q: %w", command.Review.Decision, domain.ErrInvalid)
 	}
-	// Freeze the eligible deployment set before touching any existing jobs.
-	// SetProjectionTarget takes the conflicting target lock before cancelling
-	// jobs, so this target -> job order prevents approval/retirement deadlocks.
-	// A target registered after this statement is handled by backfill.
+	// Freeze the eligible target rows before touching any existing jobs. The
+	// outer deployment lock prevents target membership from changing between
+	// the singleton snapshot and this ordered target lock.
 	eligibleProjectionSpaces, err := lockEligibleProjectionTargets(ctx, tx)
 	if err != nil {
 		return domain.MemoryCandidate{}, nil, err

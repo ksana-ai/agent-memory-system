@@ -19,6 +19,7 @@ export LMSTUDIO_EMBEDDINGS_URL LMSTUDIO_EMBEDDING_MODEL
 SERVER_BINARY := $(CURDIR)/bin/agent-memory-server
 EVAL_BINARY := $(CURDIR)/bin/agent-memory-eval
 PROJECTION_WORKER_BINARY := $(CURDIR)/bin/agent-memory-projection-worker
+PROJECTION_RECONCILER_BINARY := $(CURDIR)/bin/agent-memory-projection-reconciler
 EVAL_V2_DATASET := $(CURDIR)/datasets/memory-lifecycle-v2.json
 EVAL_SEMANTIC_V1_DATASET := $(CURDIR)/datasets/memory-semantic-extension-v1.json
 EVAL_V2_MANIFEST := $(CURDIR)/artifacts/eval/memory-lifecycle-v2-latest.json
@@ -27,7 +28,7 @@ EVAL_VECTOR_V2_MANIFEST := $(CURDIR)/artifacts/eval/memory-lifecycle-v2-postgres
 EVAL_SEMANTIC_V1_MANIFEST := $(CURDIR)/artifacts/eval/memory-semantic-extension-v1-postgres-vector-latest.json
 GO_FILES := $(shell find . -path './.cache' -prune -o -path './.git' -prune -o -name '*.go' -type f -print)
 
-.PHONY: build build-eval build-projection-worker build-server db-down db-up eval eval-postgres eval-postgres-recorded eval-recorded eval-semantic eval-semantic-recorded eval-v2 eval-vector eval-vector-recorded fmt fmt-check migrate projection-target-register projection-worker projection-worker-probe semantic-frozen server test test-integration test-outbox-integration test-race test-vector-integration test-worker-integration test-worker-vector-integration verify verify-postgres verify-semantic verify-vector verify-worker vet
+.PHONY: build build-eval build-projection-reconciler build-projection-worker build-server db-down db-up eval eval-postgres eval-postgres-recorded eval-recorded eval-semantic eval-semantic-recorded eval-v2 eval-vector eval-vector-recorded fmt fmt-check migrate projection-backfill projection-reconcile projection-target-register projection-worker projection-worker-probe semantic-frozen server test test-integration test-outbox-integration test-race test-reconciliation-integration test-vector-integration test-worker-integration test-worker-vector-integration verify verify-postgres verify-reconciliation verify-semantic verify-vector verify-worker vet
 
 build:
 	$(GO) build ./...
@@ -43,6 +44,10 @@ build-eval:
 build-projection-worker:
 	mkdir -p $(CURDIR)/bin
 	$(GO) build -o $(PROJECTION_WORKER_BINARY) ./cmd/projection-worker
+
+build-projection-reconciler:
+	mkdir -p $(CURDIR)/bin
+	$(GO) build -o $(PROJECTION_RECONCILER_BINARY) ./cmd/projection-reconciler
 
 db-up:
 	docker compose up -d --wait postgres
@@ -108,6 +113,10 @@ test-worker-vector-integration: db-up build-projection-worker
 	@TEST_PROJECTION_WORKER_BINARY='$(PROJECTION_WORKER_BINARY)' \
 		$(GO) test -p 1 -race -tags='integration vector' -count=1 ./internal/embedding ./cmd/projection-worker
 
+test-reconciliation-integration: db-up build-projection-reconciler
+	@TEST_PROJECTION_RECONCILER_BINARY='$(PROJECTION_RECONCILER_BINARY)' \
+		$(GO) test -p 1 -race -tags=integration -count=1 ./internal/migrations ./internal/store/postgres ./cmd/projection-reconciler
+
 test-race:
 	$(GO) test -race ./...
 
@@ -131,6 +140,12 @@ projection-target-register: db-up
 projection-worker: db-up
 	@PROJECTION_WORKER_MODE=run $(GO) run ./cmd/projection-worker
 
+projection-backfill: db-up
+	@PROJECTION_RECONCILER_MODE=backfill $(GO) run ./cmd/projection-reconciler
+
+projection-reconcile: db-up
+	@PROJECTION_RECONCILER_MODE=audit $(GO) run ./cmd/projection-reconciler
+
 verify-postgres: test-integration eval-postgres
 
 verify-vector: test-vector-integration eval-vector
@@ -138,3 +153,5 @@ verify-vector: test-vector-integration eval-vector
 verify-semantic: test-vector-integration eval-semantic
 
 verify-worker: test-worker-integration test-worker-vector-integration
+
+verify-reconciliation: test-reconciliation-integration

@@ -166,6 +166,10 @@ func (s *Store) RegisterProjectionTarget(ctx context.Context, command RegisterPr
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 
+	if _, err := lockProjectionDeploymentExclusive(ctx, tx); err != nil {
+		return ProjectionTarget{}, err
+	}
+
 	_, err = tx.Exec(ctx, `
 		INSERT INTO agent_memory.embedding_spaces (
 			id, provider, model, dimension, document_version, query_version,
@@ -193,7 +197,7 @@ func (s *Store) RegisterProjectionTarget(ctx context.Context, command RegisterPr
 		return ProjectionTarget{}, fmt.Errorf("embedding space configuration differs from its registry: %w", domain.ErrConflict)
 	}
 
-	_, err = tx.Exec(ctx, `
+	commandTag, err := tx.Exec(ctx, `
 		INSERT INTO agent_memory.embedding_projection_targets (
 			embedding_space, state, enqueue_new, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $4)
@@ -213,6 +217,11 @@ func (s *Store) RegisterProjectionTarget(ctx context.Context, command RegisterPr
 	}
 	if target.State != normalized.State || target.EnqueueNew != normalized.EnqueueNew {
 		return ProjectionTarget{}, fmt.Errorf("projection target initial configuration differs from its registry: %w", domain.ErrConflict)
+	}
+	if commandTag.RowsAffected() == 1 {
+		if _, err := advanceProjectionDeploymentGeneration(ctx, tx); err != nil {
+			return ProjectionTarget{}, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return ProjectionTarget{}, mapProjectionPostgresError("commit projection target registration", err)
@@ -236,6 +245,10 @@ func (s *Store) SetProjectionTarget(ctx context.Context, command SetProjectionTa
 		return ProjectionTarget{}, mapProjectionPostgresError("begin projection target update", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	if _, err := lockProjectionDeploymentExclusive(ctx, tx); err != nil {
+		return ProjectionTarget{}, err
+	}
 
 	current, err := readProjectionTarget(ctx, tx, normalized.EmbeddingSpace, true)
 	if err != nil {
@@ -281,6 +294,9 @@ func (s *Store) SetProjectionTarget(ctx context.Context, command SetProjectionTa
 		if err := cancelRetiredProjectionJobs(ctx, tx, normalized.EmbeddingSpace); err != nil {
 			return ProjectionTarget{}, err
 		}
+	}
+	if _, err := advanceProjectionDeploymentGeneration(ctx, tx); err != nil {
+		return ProjectionTarget{}, err
 	}
 	target, err := readProjectionTarget(ctx, tx, normalized.EmbeddingSpace, false)
 	if err != nil {

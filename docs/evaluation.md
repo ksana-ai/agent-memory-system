@@ -38,6 +38,12 @@ The factory probes the endpoint with a fixed public input, requires the returned
 
 The vector wrapper uses the same random physical namespaces as FTS. Cleanup calls `ForgetUser`, proves lifecycle and embedding rows are gone, and only then removes the evaluation tombstone. Concurrent projection races with supersession and erasure accept either valid serialization result and prove that no stale vector remains.
 
+## Projection coverage acceptance
+
+Projection reconciliation is an operational database gate, not another retrieval arm or quality metric. `projection-backfill` scans one explicit target under a stable deployment generation and idempotently repairs durable database work without calling the embedding endpoint. The repository briefly reads content-bearing card fields to recompute the versioned document hash, but those fields do not enter reconciliation jobs, cursors, reports, logs, or returned errors; no heap-zeroization claim is made. Content-free jobs/cursors retain the scope/card identifiers required for database traversal, but the CLI never logs them. The fenced worker must still process runnable jobs. `projection-reconcile` does not mutate projection/card state, but startup may apply migrations and the scan takes row locks; it returns aggregate classifications and exits with the fixed `projection reconciliation incomplete` error unless every eligible active card is converged.
+
+Missing jobs, pending/leased/retry work, dead or cancelled terminal jobs, succeeded jobs without a vector, a derived-document hash mismatch, and stored version invariants remain visible separately. Dead/cancelled jobs are blockers and are not automatically retried. A complete report is evidence about current PostgreSQL coverage for one space/generation only: it does not score relevance, identify model weights, promote the target, switch the server from FTS, or prove provider-side deletion. An erasure can prevent later database persistence and cascade jobs/vectors, but it cannot recall I/O already received by an embedding provider.
+
 The original 30-case lifecycle regression at freeze revision `0e32fbaa2e783f9d3e71de6940c9e3a2e59eb34a` is:
 
 | Arm | Recall@5 | MRR | nDCG@10 | Policy pass |
@@ -112,9 +118,10 @@ make eval-vector
 make eval-vector-recorded
 make eval-semantic
 make eval-semantic-recorded
+make verify-reconciliation
 ```
 
-`make verify` includes `eval-v2`; it gates policy invariants but does not enforce a latency threshold. `make verify-postgres` separately runs the real PostgreSQL transaction/process/FTS tests and the three-arm policy gate. `make verify-vector` is intentionally separate: it requires both Docker PostgreSQL and the configured live LM Studio endpoint, runs embedding/store/evaluator race integration tests, then runs all four arms on the original dataset. `make verify-worker` separately exercises fenced repository transitions, a killed-process lease recovery, deletion propagation, exact probe behavior across batch shapes, and a real LM Studio worker projection. `make verify-semantic` applies the component gate to the semantic extension. Each recorded evaluation target performs three measured searches per query and fails unless the checkout and binary prove a matching clean revision.
+`make verify` includes `eval-v2`; it gates policy invariants but does not enforce a latency threshold. `make verify-postgres` separately runs the real PostgreSQL transaction/process/FTS tests and the three-arm policy gate. `make verify-vector` is intentionally separate: it requires both Docker PostgreSQL and the configured live LM Studio endpoint, runs embedding/store/evaluator race integration tests, then runs all four arms on the original dataset. `make verify-worker` separately exercises fenced repository transitions, a killed-process lease recovery, deletion propagation, exact probe behavior across batch shapes, and a real LM Studio worker projection. `make verify-reconciliation` exercises the generation-fenced repository plus an actual DB-only CLI kill/restart, idempotency, and deletion-propagation path; it does not require LM Studio. `make verify-semantic` applies the component gate to the semantic extension. Each recorded evaluation target performs three measured searches per query and fails unless the checkout and binary prove a matching clean revision.
 
 ## Evidence levels and boundaries
 
@@ -126,7 +133,7 @@ make eval-semantic-recorded
 
 The deterministic in-memory comparison is level 2. Selecting `reviewed-cards-postgres-fts-v1` adds level-3 PostgreSQL FTS evidence; selecting `reviewed-cards-postgres-vector-v1` adds level-3 LM Studio and pgvector evidence. The preregistered semantic extension adds a synthetic first-look comparison, marginal uncertainty, latency smoke observations, and bad-case analysis, but it is not independently held out and therefore does not by itself satisfy level 4. Both real-component arms still retrieve pre-authored, explicitly approved memory cards. They do not evaluate LLM extraction, evidence verification by a model, long-conversation chunking, reranking, answer generation, token cost, concurrent load, or production traffic.
 
-`make verify-postgres` is level-3 component evidence for migrations, transactions, FTS, restart recovery, and deletion propagation. `make verify-vector` adds real pgvector retrieval and live embedding-endpoint evidence. `make verify-worker` adds a durable claimant/lease processor, retry/dead-letter transitions, atomic vector acknowledgement, and real-process recovery evidence. It is still not a production indexing pipeline without backfill, reconciliation, serving-space promotion, and query-path integration; the evaluator continues to project synchronously and the server continues to use FTS.
+`make verify-postgres` is level-3 component evidence for migrations, transactions, FTS, restart recovery, and deletion propagation. `make verify-vector` adds real pgvector retrieval and live embedding-endpoint evidence. `make verify-worker` adds a durable claimant/lease processor, retry/dead-letter transitions, atomic vector acknowledgement, and real-process recovery evidence. `make verify-reconciliation` adds generation-fenced backfill/audit, CLI restart/idempotency, and database deletion-propagation evidence. This is still not a production indexing pipeline without atomic serving-space promotion/invalidation and query-path integration; the evaluator continues to project synchronously and the server continues to use FTS.
 
 ## Current comparison and next gate
 

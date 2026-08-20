@@ -19,7 +19,7 @@ import (
 
 var migrationDatabaseSequence atomic.Uint64
 
-func TestApplyFreshProjectionOutboxSchemaAndReapply(t *testing.T) {
+func TestApplyFreshProjectionSchemaAndReapply(t *testing.T) {
 	databaseURL := isolatedMigrationDatabase(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -43,11 +43,15 @@ func TestApplyFreshProjectionOutboxSchemaAndReapply(t *testing.T) {
 		FROM public.agent_memory_schema_version`).Scan(&version, &versionRows); err != nil {
 		t.Fatalf("read schema version: %v", err)
 	}
-	if version != 5 || versionRows != 1 {
-		t.Fatalf("schema version=%d rows=%d, want version 5 in one row", version, versionRows)
+	if version != 6 || versionRows != 1 {
+		t.Fatalf("schema version=%d rows=%d, want version 6 in one row", version, versionRows)
 	}
 
-	for _, table := range []string{"embedding_projection_targets", "embedding_projection_jobs"} {
+	for _, table := range []string{
+		"embedding_projection_targets",
+		"embedding_projection_jobs",
+		"embedding_projection_deployment",
+	} {
 		var exists bool
 		if err := conn.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, "agent_memory."+table).Scan(&exists); err != nil {
 			t.Fatalf("inspect %s: %v", table, err)
@@ -81,9 +85,71 @@ func TestApplyFreshProjectionOutboxSchemaAndReapply(t *testing.T) {
 	assertIndexDefinition(t, ctx, conn, "embedding_projection_targets_one_serving_idx", "UNIQUE", "WHERE (state = 'serving'::text)")
 	assertIndexDefinition(t, ctx, conn, "embedding_projection_jobs_claim_idx", "available_at, created_at, id", "state = ANY (ARRAY['pending'::text, 'retry'::text])")
 	assertIndexDefinition(t, ctx, conn, "embedding_projection_jobs_lease_until_idx", "lease_until, id", "WHERE (state = 'leased'::text)")
+	assertIndexDefinition(t, ctx, conn, "memory_cards_active_projection_scan_idx", "COLLATE \"C\"", "WHERE (status = 'active'::text)")
+	assertIndexDefinition(t, ctx, conn, "embedding_projection_jobs_space_scope_memory_idx", "embedding_space, tenant_id, user_id, memory_id")
+	assertIndexDefinition(t, ctx, conn, "memory_embeddings_space_scope_memory_idx", "embedding_space, tenant_id, user_id, memory_id")
+	assertProjectionDeploymentState(t, ctx, conn)
 
 	seedProjectionFixtures(t, ctx, conn)
 	assertProjectionConstraints(t, ctx, conn)
+}
+
+func assertProjectionDeploymentState(t *testing.T, ctx context.Context, conn *pgx.Conn) {
+	t.Helper()
+
+	var singleton bool
+	var generation, rows int64
+	var createdAt, updatedAt time.Time
+	if err := conn.QueryRow(ctx, `
+		SELECT singleton, generation, created_at, updated_at, count(*) OVER ()
+		FROM agent_memory.embedding_projection_deployment`,
+	).Scan(&singleton, &generation, &createdAt, &updatedAt, &rows); err != nil {
+		t.Fatalf("read projection deployment state: %v", err)
+	}
+	if !singleton || generation != 0 || rows != 1 || createdAt.IsZero() || updatedAt.Before(createdAt) {
+		t.Fatalf(
+			"deployment singleton=%t generation=%d rows=%d created_at=%s updated_at=%s",
+			singleton, generation, rows, createdAt, updatedAt,
+		)
+	}
+
+	type columnExpectation struct {
+		name        string
+		dataType    string
+		defaultPart string
+	}
+	for _, column := range []columnExpectation{
+		{name: "singleton", dataType: "boolean", defaultPart: "true"},
+		{name: "generation", dataType: "bigint", defaultPart: "0"},
+		{name: "created_at", dataType: "timestamp with time zone", defaultPart: "clock_timestamp()"},
+		{name: "updated_at", dataType: "timestamp with time zone", defaultPart: "clock_timestamp()"},
+	} {
+		var dataType, nullable, defaultValue string
+		if err := conn.QueryRow(ctx, `
+			SELECT data_type, is_nullable, column_default
+			FROM information_schema.columns
+			WHERE table_schema = 'agent_memory'
+			  AND table_name = 'embedding_projection_deployment'
+			  AND column_name = $1`, column.name,
+		).Scan(&dataType, &nullable, &defaultValue); err != nil {
+			t.Fatalf("inspect deployment column %s: %v", column.name, err)
+		}
+		if dataType != column.dataType || nullable != "NO" || !strings.Contains(defaultValue, column.defaultPart) {
+			t.Fatalf(
+				"deployment column %s type=%q nullable=%q default=%q, want %q/NO containing %q",
+				column.name, dataType, nullable, defaultValue, column.dataType, column.defaultPart,
+			)
+		}
+	}
+
+	assertSQLState(t, ctx, conn, `
+		INSERT INTO agent_memory.embedding_projection_deployment (singleton)
+		VALUES (false)`, "23514", "false deployment singleton")
+	assertSQLState(t, ctx, conn, `
+		INSERT INTO agent_memory.embedding_projection_deployment DEFAULT VALUES`, "23505", "second deployment singleton")
+	assertSQLState(t, ctx, conn, `
+		UPDATE agent_memory.embedding_projection_deployment
+		SET generation = -1`, "23514", "negative deployment generation")
 }
 
 func isolatedMigrationDatabase(t *testing.T) string {
