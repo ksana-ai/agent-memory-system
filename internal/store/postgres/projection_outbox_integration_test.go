@@ -182,40 +182,21 @@ func TestProjectionRepositoryConcurrentRegistrationRejectsSpaceDrift(t *testing.
 	}
 }
 
-func TestProjectionRepositoryAllowsOnlyOneServingTarget(t *testing.T) {
+func TestProjectionRepositoryRejectsInitialServingTarget(t *testing.T) {
 	ctx := context.Background()
 	databaseURL := requiredDatabaseURL(t)
 	applyMigrations(t, databaseURL)
 	storage := openStore(t, databaseURL)
 	defer storage.Close()
 
-	secondSpace := uniqueProjectionRepositorySpace("serving_b")
-	cleanupProjectionRepositorySpaces(t, databaseURL, secondSpace)
-	targets, err := storage.ProjectionTargets(ctx)
-	if err != nil {
-		t.Fatalf("list existing targets: %v", err)
+	space := uniqueProjectionRepositorySpace("initial_serving_rejected")
+	cleanupProjectionRepositorySpaces(t, databaseURL, space)
+	command := projectionRepositoryRegistration(space, postgres.ProjectionTargetServing, true, fixtureTime(21))
+	if _, err := storage.RegisterProjectionTarget(ctx, command); !errors.Is(err, domain.ErrInvalid) {
+		t.Fatalf("initial serving target error=%v, want invalid", err)
 	}
-	hasServing := false
-	for _, target := range targets {
-		if target.State == postgres.ProjectionTargetServing {
-			hasServing = true
-			break
-		}
-	}
-	if !hasServing {
-		firstSpace := uniqueProjectionRepositorySpace("serving_a")
-		cleanupProjectionRepositorySpaces(t, databaseURL, firstSpace)
-		firstCommand := projectionRepositoryRegistration(firstSpace, postgres.ProjectionTargetServing, false, fixtureTime(20))
-		if _, err := storage.RegisterProjectionTarget(ctx, firstCommand); err != nil {
-			t.Fatalf("register first serving target: %v", err)
-		}
-	}
-	secondCommand := projectionRepositoryRegistration(secondSpace, postgres.ProjectionTargetServing, false, fixtureTime(21))
-	if _, err := storage.RegisterProjectionTarget(ctx, secondCommand); !errors.Is(err, domain.ErrConflict) {
-		t.Fatalf("second serving target error=%v, want conflict", err)
-	}
-	if _, err := storage.ProjectionTargetBySpace(ctx, secondSpace); !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("rolled-back second target error=%v, want not found", err)
+	if _, err := storage.ProjectionTargetBySpace(ctx, space); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("rejected serving target error=%v, want not found", err)
 	}
 
 	conn, err := pgx.Connect(ctx, databaseURL)
@@ -223,12 +204,12 @@ func TestProjectionRepositoryAllowsOnlyOneServingTarget(t *testing.T) {
 		t.Fatalf("connect to inspect serving rollback: %v", err)
 	}
 	defer conn.Close(context.Background())
-	var secondSpaceRows int
-	if err := conn.QueryRow(ctx, `SELECT count(*) FROM agent_memory.embedding_spaces WHERE id=$1`, secondSpace).Scan(&secondSpaceRows); err != nil {
+	var spaceRows int
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM agent_memory.embedding_spaces WHERE id=$1`, space).Scan(&spaceRows); err != nil {
 		t.Fatalf("count rolled-back embedding space: %v", err)
 	}
-	if secondSpaceRows != 0 {
-		t.Fatalf("second serving transaction left %d embedding-space rows, want 0", secondSpaceRows)
+	if spaceRows != 0 {
+		t.Fatalf("rejected serving transaction left %d embedding-space rows, want 0", spaceRows)
 	}
 }
 

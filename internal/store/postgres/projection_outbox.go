@@ -254,6 +254,12 @@ func (s *Store) SetProjectionTarget(ctx context.Context, command SetProjectionTa
 	if err != nil {
 		return ProjectionTarget{}, err
 	}
+	// Serving membership is a coverage-backed deployment decision. The generic
+	// target editor may change shadow/blocked/retired behavior, but it must not
+	// enter, leave, or rewrite serving state outside PromoteProjection.
+	if current.State == ProjectionTargetServing || normalized.State == ProjectionTargetServing {
+		return ProjectionTarget{}, fmt.Errorf("serving projection state can only change through promotion: %w", domain.ErrConflict)
+	}
 	// Retired is terminal. Re-enabling the same vector space after operators
 	// have begun cleanup would make coverage ambiguous; a new deployment must
 	// register a new immutable space instead.
@@ -604,6 +610,9 @@ func validateRegisterProjectionTarget(command RegisterProjectionTargetCommand) (
 	}
 	if err := validateProjectionTargetSettings(command.State, command.EnqueueNew); err != nil {
 		return RegisterProjectionTargetCommand{}, err
+	}
+	if command.State == ProjectionTargetServing {
+		return RegisterProjectionTargetCommand{}, fmt.Errorf("initial serving projection requires promotion: %w", domain.ErrInvalid)
 	}
 	if command.CreatedAt.IsZero() {
 		return RegisterProjectionTargetCommand{}, fmt.Errorf("projection target created_at is required: %w", domain.ErrInvalid)

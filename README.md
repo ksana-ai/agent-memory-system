@@ -2,7 +2,7 @@
 
 A Go-native, evidence-first memory service for agents. It separates raw conversation evidence, untrusted memory proposals, reviewed/versioned memory cards, and the Context Pack assembled for one request.
 
-> **Current status: durable PostgreSQL vertical slice plus measured lexical and dense retrieval components.** The server binary still uses PostgreSQL FTS. Approved cards atomically enqueue content-free projection jobs, a separate leased/fenced worker can project them through local LM Studio into pgvector, and a DB-only reconciler can idempotently backfill and audit one stable target generation. Atomic serving-space promotion/invalidation and a dense/hybrid server read path are not implemented. An independently selectable evaluation arm measures exact cosine retrieval without presenting that evaluator path—or the shadow worker—as the production server.
+> **Current status: durable PostgreSQL vertical slice plus measured lexical and dense retrieval components.** The server binary still uses PostgreSQL FTS. Approved cards atomically enqueue content-free projection jobs, a separate leased/fenced worker can project them through local LM Studio into pgvector, a DB-only reconciler can idempotently backfill and audit one stable target generation, and a coverage-backed transaction can atomically promote one serving space. Dense/hybrid server retrieval is not implemented. An independently selectable evaluation arm measures exact cosine retrieval without presenting that evaluator path—or a serving-space selection—as the production server.
 
 ## Why this project exists
 
@@ -20,10 +20,11 @@ flowchart LR
     B --> O
     O --> W[Leased and fenced worker]
     W --> V[LM Studio + pgvector]
+    V --> G[Coverage-backed serving promotion]
     M -. evaluator-only projection .-> V
     E --> P[Context Pack with sources]
     S --> P
-    V -. evaluation arm .-> P
+    V -. evaluation arm only .-> P
 ```
 
 The implemented invariants are:
@@ -34,6 +35,7 @@ The implemented invariants are:
 - When projection targets are enabled, that same approval transaction creates one durable, content-free job per eligible embedding space; rejection creates none.
 - The worker claims one job at a time using a database-clock lease, releases all database locks before embedding HTTP, and atomically fences vector persistence with job acknowledgement.
 - Backfill scans a stable deployment generation in bounded pages and repairs only PostgreSQL jobs/derived vectors; audit does not mutate projection/card state and fails unless aggregate coverage is complete.
+- Promotion revalidates every serviceable card at one PostgreSQL cutoff, compare-and-swaps the serving target, advances every live scope revision plus the deployment generation, and records an immutable idempotency receipt in one transaction.
 - Each worker attempt binds the public probe and versioned card document in one bounded embedding request; a public-probe behavior mismatch is terminal for that job. This detects probe-visible drift, not full model identity or weights.
 - PostgreSQL keys, foreign keys, and queries carry both `tenant_id` and `user_id`.
 - A Context Pack uses one request-time `as_of` value and returns only active, unexpired cards with the source evidence needed to audit them.
@@ -50,8 +52,9 @@ The implemented invariants are:
 | Deletion propagation | DELETE commits, PostgreSQL FTS returns nothing, a third server process still sees nothing, and database tables are inspected; pgvector rows and projection jobs cascade with their cards, and a later worker run cannot recreate them | PostgreSQL backup/PITR deletion policy is not implemented; deletion cannot recall provider I/O or physically erase a document already copied into worker memory |
 | Time-based serviceability | Optional absolute `expires_at` is copied from candidate to card; equality is expired and is checked in storage, retrieval, and Context Pack assembly | Expiration does not delete data or change the card's lifecycle status |
 | Offline evaluation | Legacy 8-case smoke fixture plus separate 30-case lifecycle and 30-case semantic-extension datasets; four-arm manifests report quality, deterministic marginal intervals, policy, provenance, latency smoke, and cleanup | Uses authored cards and synthetic queries; the first-look extension is now a regression set and does not measure extraction, concurrent load, answer quality, or production traffic |
-| Durable projection handoff | Approval enqueue plus a DB-clock `SKIP LOCKED` worker; fenced retry/dead-letter/finalize transitions; atomic vector+ack; fake-provider kill/restart recovery; real LM Studio process projection; erasure and stale-worker tests | One job/concurrency in v1; no serving-space rotation or server dense/hybrid read path |
-| Projection coverage | Generation-fenced, bounded, DB-only backfill and non-mutating aggregate audit; killed-process restart, natural-key idempotency, and deletion propagation tests | Audit startup may apply migrations and its bounded scans take row locks; pending/leased/retry require the worker; dead/cancelled are explicit blockers; audit does not promote a target |
+| Durable projection handoff | Approval enqueue plus a DB-clock `SKIP LOCKED` worker; fenced retry/dead-letter/finalize transitions; atomic vector+ack; fake-provider kill/restart recovery; real LM Studio process projection; erasure and stale-worker tests | One job/concurrency in v1; no server dense/hybrid read path |
+| Projection coverage | Generation-fenced, bounded, DB-only backfill and non-mutating aggregate audit; killed-process restart, natural-key idempotency, and deletion propagation tests | Audit startup may apply migrations and its bounded scans take row locks; pending/leased/retry require the worker; dead/cancelled are explicit blockers; promotion is a separate full revalidation |
+| Serving-space deployment | Explicit expected-source compare-and-swap, O(N) coverage proof, atomic target/revision/generation switch, durable UUID receipt, rollback through the same gate, and actual CLI restart recovery after the probe endpoint is removed | Changes PostgreSQL deployment state only; server remains FTS, the public probe is behavior drift detection rather than model identity or a quality/SLA claim, and v1 has no receipt-retention/deletion API |
 | Dense retrieval component | Versioned card documents, a bounded OpenAI-compatible embeddings client, `vector(1024)` projections, exact scoped cosine search, lifecycle cleanup, and a real-component evaluation arm | Evaluator still projects synchronously; the server remains FTS and has no hybrid fusion or ANN index |
 
 The in-memory adapter remains only for fast unit tests and deterministic offline evaluation. `cmd/server` has no in-memory fallback and fails fast when PostgreSQL is unavailable.
@@ -62,7 +65,7 @@ Requirements:
 
 - Go 1.25+
 - Docker Engine with Docker Compose
-- LM Studio serving `text-embedding-bge-m3` on an OpenAI-compatible embeddings endpoint, for vector verification and the projection worker
+- LM Studio serving `text-embedding-bge-m3` on an OpenAI-compatible embeddings endpoint, for vector verification, the projection worker, and a first-time promotion
 
 Make invokes Go with `GOSUMDB=$(GO_CHECKSUM_DB)` and defaults `GO_CHECKSUM_DB` to `sum.golang.org`, so an auto-downloaded Go toolchain is checksum-verified even when the surrounding shell disables the checksum database. Environments using an approved checksum mirror can override that project variable.
 
@@ -96,7 +99,7 @@ Docker Compose uses `pgvector/pgvector:0.8.6-pg18-bookworm`, binds PostgreSQL on
 
 The default development credentials are listed in `.env.example`. Make does not load `.env`; pass overrides through the shell or on the Make command line. It exports `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_PORT` to Compose and derives the default DSN without printing it. A complete `DATABASE_URL`/`TEST_DATABASE_URL` can also be supplied. The binaries intentionally do not accept DSN flags, keeping credentials out of their advertised process arguments. Changing initialization credentials does not rewrite an existing PostgreSQL volume; recreating that disposable development volume is a separate, destructive operation.
 
-The vector targets read `LMSTUDIO_EMBEDDINGS_URL` and `LMSTUDIO_EMBEDDING_MODEL` from the environment; defaults match the local endpoint shown in `.env.example`. The endpoint is deliberately excluded from process arguments, errors, evaluation descriptors, and manifests. Keep LM Studio running before invoking `make verify-vector` or `make verify-worker`.
+The vector targets read `LMSTUDIO_EMBEDDINGS_URL` and `LMSTUDIO_EMBEDDING_MODEL` from the environment; defaults match the local endpoint shown in `.env.example`. The endpoint is deliberately excluded from process arguments, errors, evaluation descriptors, and manifests. Keep LM Studio running before invoking `make verify-vector`, `make verify-worker`, or a new `make projection-promote`. `make verify-promotion` uses a bounded fake public-probe endpoint and does not require LM Studio.
 
 Projection deployment is explicit. Probe the live endpoint, export the exact derived space, register it as a new shadow target, and then start the worker:
 
@@ -118,7 +121,20 @@ PROJECTION_WORKER_ONCE=true make projection-worker # repeat, or run continuous w
 make projection-reconcile
 ```
 
-The reconciler never connects to LM Studio or logs scope/card identifiers or card content. Its repository briefly reads content-bearing card fields to recompute the versioned document hash; those fields enter no job, cursor, report, log, or error, and this makes no heap-zeroization claim. Content-free jobs/cursors still carry the identifiers needed for database traversal. `projection-backfill` requires an enqueue-enabled shadow/serving target; it may enqueue or repair PostgreSQL work but does not create vectors itself, so rerun the worker until no runnable work remains. Repair that removes or invalidates a serving vector conservatively advances the affected scope revision. `projection-reconcile` exits nonzero with the fixed `projection reconciliation incomplete` error while any eligible card is missing/in-flight/inconsistent or has a dead/cancelled blocker. Dead and cancelled jobs are deliberately not retried by reconciliation. A target change invalidates the current content-free cursor and causes a bounded restart from the beginning. Neither a complete audit nor a registered shadow target changes the FTS server path; serving-space promotion and dense/hybrid query integration remain separate unfinished operations.
+The reconciler never connects to LM Studio or logs scope/card identifiers or card content. Its repository briefly reads content-bearing card fields to recompute the versioned document hash; those fields enter no job, cursor, report, log, or error, and this makes no heap-zeroization claim. Content-free jobs/cursors still carry the identifiers needed for database traversal. `projection-backfill` requires an enqueue-enabled shadow/serving target; it may enqueue or repair PostgreSQL work but does not create vectors itself, so rerun the worker until no runnable work remains. Repair that removes or invalidates a serving vector conservatively advances the affected scope revision. `projection-reconcile` exits nonzero with the fixed `projection reconciliation incomplete` error while any eligible card is missing/in-flight/inconsistent or has a dead/cancelled blocker. Dead and cancelled jobs are deliberately not retried by reconciliation. A target change invalidates the current content-free cursor and causes a bounded restart from the beginning. A complete audit is useful operator evidence, but promotion independently revalidates coverage under its own transaction.
+
+Promote the fully covered shadow target with an explicit compare-and-swap source and a new canonical lowercase UUID:
+
+```bash
+export PROJECTION_PROMOTER_EMBEDDING_SPACE="$PROJECTION_WORKER_EMBEDDING_SPACE"
+export PROJECTION_PROMOTER_EXPECTED_FROM=none # or the exact current serving space
+export PROJECTION_PROMOTER_OPERATION_ID='8d91b379-d6f7-42d4-9df0-b6c0a136c8d1'
+make projection-promote
+```
+
+Generate a fresh UUID for every intended transition; the value above is only a shape example. Empty databases fail closed unless the operator deliberately sets `PROJECTION_PROMOTER_ALLOW_EMPTY=true`. For a new operation the CLI first sends the fixed public probe, requires its derived immutable space to equal the explicit destination, then asks PostgreSQL to recheck every serviceable card. The atomic transaction moves the previous serving target back to enqueue-enabled shadow, promotes the destination, advances all live scope revisions and the deployment generation, and stores aggregate counts/times in an immutable receipt. This is an offline O(N) gate that can pause approvals and scope writers.
+
+If the CLI loses the first result after PostgreSQL commits, retry the exact same UUID/source/destination/empty choice. The CLI returns the durable receipt before contacting LM Studio, so crash recovery does not depend on endpoint availability and does not advance revisions or generation twice. That replay proves only the historical database commit, not current endpoint health. A first execution's probe is a fixed-input behavior fingerprint—not a model-weights hash—and occurs before the database transaction, leaving a probe-to-commit time-of-check/time-of-use window. Rollback is a new promotion with source/destination reversed, a fresh UUID, the endpoint configured for that destination, and the same full coverage gate. Receipts have no public deletion API in v1; target retirement retains them, and their foreign keys prevent referenced space deletion. A future retention policy would explicitly shorten the corresponding UUID replay window. Promotion still does not change the server retrieval path: `cmd/server` remains on PostgreSQL FTS until dense/hybrid integration is separately implemented and accepted.
 
 ## Exercise the lifecycle
 
@@ -196,6 +212,7 @@ make verify-postgres    # Docker health, migrations, PG/process tests + real FTS
 make test-outbox-integration # three repeated migration, transaction, restart, and deletion rounds
 make verify-worker      # fenced worker repository/process recovery + real LM Studio projection
 make verify-reconciliation # generation-fenced DB backfill/audit + killed-process restart/deletion
+make verify-promotion   # atomic serving swap + CLI receipt replay with fake public probe
 make eval               # deterministic lexical smoke evaluation
 make eval-v2            # 30-case no-memory vs reviewed-card BM25 policy gate
 make eval-postgres      # same 30 cases across no-memory, Go BM25, and real PG FTS
@@ -205,7 +222,7 @@ make verify-semantic    # frozen semantic-extension integration tests and four-a
 make eval-semantic      # harder 30-case semantic extension; clean committed checkout required
 ```
 
-The PostgreSQL test tag is intentionally strict: invoking it directly without `TEST_DATABASE_URL`, or invoking a process test without its `TEST_SERVER_BINARY`/`TEST_PROJECTION_WORKER_BINARY`/`TEST_PROJECTION_RECONCILER_BINARY`, fails instead of silently skipping.
+The PostgreSQL test tag is intentionally strict: invoking it directly without `TEST_DATABASE_URL`, or invoking a process test without its `TEST_SERVER_BINARY`/`TEST_PROJECTION_WORKER_BINARY`/`TEST_PROJECTION_RECONCILER_BINARY`/`TEST_PROJECTION_PROMOTER_BINARY`, fails instead of silently skipping.
 
 To retain a machine-readable v2 run from a clean committed revision:
 
@@ -235,6 +252,7 @@ cmd/migrate/                 Explicit embedded-migration runner
 cmd/eval/                    Deterministic offline evaluation
 cmd/projection-worker/       Explicit probe/register/run worker and process tests
 cmd/projection-reconciler/   DB-only backfill/audit CLI and process restart tests
+cmd/projection-promoter/     Atomic serving-space promotion and receipt-replay process test
 datasets/                    Versioned evaluation fixtures
 docs/                        Architecture, ADRs, and evaluation policy
 internal/api/                Strict HTTP/JSON boundary
@@ -251,7 +269,7 @@ compose.yaml                 Local PostgreSQL/pgvector service
 
 ## Roadmap
 
-1. Define and verify an atomic serving-space promotion/invalidation procedure before switching the server to dense or hybrid retrieval.
+1. Add a revision-pinned dense/hybrid server read path that resolves only the serving space, fails closed on provider/deployment drift, and keeps PostgreSQL FTS as the explicit default until acceptance.
 2. Compare reciprocal-rank fusion/reranking against the retained FTS and dense ranking errors; add ANN only after a scale/load benchmark justifies its recall tradeoff.
 3. Add an independently sourced, blinded evaluation cohort and paired comparison before making a model-promotion claim.
 4. Add authenticated principals, authorization, PII policy, rate limits, redacted observability, backup/restore, and backup-aware erasure.

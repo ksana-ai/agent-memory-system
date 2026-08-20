@@ -22,8 +22,8 @@ func TestEmbeddedMigrationsLoad(t *testing.T) {
 	if err := migrator.LoadMigrations(files); err != nil {
 		t.Fatalf("load migrations: %v", err)
 	}
-	if len(migrator.Migrations) != 6 {
-		t.Fatalf("migration count = %d, want 6", len(migrator.Migrations))
+	if len(migrator.Migrations) != 7 {
+		t.Fatalf("migration count = %d, want 7", len(migrator.Migrations))
 	}
 	if !strings.Contains(migrator.Migrations[0].UpSQL, "CREATE TABLE agent_memory.memory_cards") {
 		t.Fatal("initial migration does not create memory_cards")
@@ -145,6 +145,31 @@ func TestEmbeddedMigrationsLoad(t *testing.T) {
 	}
 	if !strings.Contains(migrator.Migrations[5].DownSQL, "DROP TABLE IF EXISTS agent_memory.embedding_projection_deployment") {
 		t.Fatal("deployment migration does not define its rollback")
+	}
+	if !strings.Contains(migrator.Migrations[6].UpSQL, "CREATE TABLE agent_memory.embedding_projection_promotions") {
+		t.Fatal("promotion migration does not add durable receipts")
+	}
+	for _, fragment := range []string{
+		"operation_id text COLLATE \"C\" PRIMARY KEY",
+		"from_embedding_space text COLLATE \"C\"",
+		"to_embedding_space text COLLATE \"C\" NOT NULL",
+		"covered_card_count = live_card_count",
+		"generation = previous_generation + 1",
+		"cutoff_at timestamptz NOT NULL",
+		"promoted_at timestamptz NOT NULL",
+		"promoted_at >= cutoff_at",
+		"allow_empty OR live_card_count > 0",
+		"state <> 'serving' OR enqueue_new",
+	} {
+		if !strings.Contains(migrator.Migrations[6].UpSQL, fragment) {
+			t.Fatalf("promotion receipt migration missing %q", fragment)
+		}
+	}
+	if !strings.Contains(migrator.Migrations[6].DownSQL, "DROP TABLE IF EXISTS agent_memory.embedding_projection_promotions") {
+		t.Fatal("promotion migration does not define its rollback")
+	}
+	if !strings.Contains(migrator.Migrations[6].DownSQL, "DROP CONSTRAINT IF EXISTS embedding_projection_targets_serving_enqueues") {
+		t.Fatal("promotion migration does not roll back the serving enqueue constraint")
 	}
 }
 

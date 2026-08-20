@@ -33,7 +33,7 @@ func TestPostgresVectorSchemaAndMetadata(t *testing.T) {
 	if metadata.ServerVersionNum == "" || metadata.ExtensionVersion == "" {
 		t.Fatalf("incomplete vector metadata: %#v", metadata)
 	}
-	if metadata.SchemaMigrationVersion != 6 ||
+	if metadata.SchemaMigrationVersion != 7 ||
 		metadata.Dimension != postgres.VectorDimension ||
 		metadata.DistanceMetric != postgres.VectorDistanceMetric ||
 		metadata.SearchStrategy != postgres.VectorSearchStrategy ||

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/tern/v2/migrate"
 )
 
 var migrationDatabaseSequence atomic.Uint64
@@ -43,14 +45,15 @@ func TestApplyFreshProjectionSchemaAndReapply(t *testing.T) {
 		FROM public.agent_memory_schema_version`).Scan(&version, &versionRows); err != nil {
 		t.Fatalf("read schema version: %v", err)
 	}
-	if version != 6 || versionRows != 1 {
-		t.Fatalf("schema version=%d rows=%d, want version 6 in one row", version, versionRows)
+	if version != 7 || versionRows != 1 {
+		t.Fatalf("schema version=%d rows=%d, want version 7 in one row", version, versionRows)
 	}
 
 	for _, table := range []string{
 		"embedding_projection_targets",
 		"embedding_projection_jobs",
 		"embedding_projection_deployment",
+		"embedding_projection_promotions",
 	} {
 		var exists bool
 		if err := conn.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, "agent_memory."+table).Scan(&exists); err != nil {
@@ -89,9 +92,78 @@ func TestApplyFreshProjectionSchemaAndReapply(t *testing.T) {
 	assertIndexDefinition(t, ctx, conn, "embedding_projection_jobs_space_scope_memory_idx", "embedding_space, tenant_id, user_id, memory_id")
 	assertIndexDefinition(t, ctx, conn, "memory_embeddings_space_scope_memory_idx", "embedding_space, tenant_id, user_id, memory_id")
 	assertProjectionDeploymentState(t, ctx, conn)
+	assertPromotionReceiptConstraints(t, ctx, conn)
 
 	seedProjectionFixtures(t, ctx, conn)
 	assertProjectionConstraints(t, ctx, conn)
+}
+
+func TestPromotionMigrationFailsClosedForServingTargetThatDoesNotEnqueue(t *testing.T) {
+	databaseURL := isolatedMigrationDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect promotion upgrade database: %v", err)
+	}
+	defer conn.Close(context.Background())
+	migrator, err := migrate.NewMigrator(ctx, conn, versionTable)
+	if err != nil {
+		t.Fatalf("create promotion upgrade migrator: %v", err)
+	}
+	files, err := fs.Sub(migrationFS, "sql")
+	if err != nil {
+		t.Fatalf("open promotion upgrade migrations: %v", err)
+	}
+	if err := migrator.LoadMigrations(files); err != nil {
+		t.Fatalf("load promotion upgrade migrations: %v", err)
+	}
+	if err := migrator.MigrateTo(ctx, 6); err != nil {
+		t.Fatalf("migrate promotion upgrade fixture to v6: %v", err)
+	}
+	const fingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO agent_memory.embedding_spaces (
+			id, provider, model, dimension, document_version, query_version,
+			model_fingerprint, created_at
+		) VALUES ('upgrade-space', 'fixture', 'fixture-model', 1024,
+		          'memory-card-document-v1', 'raw-query-v1', $1, clock_timestamp())`, fingerprint); err != nil {
+		t.Fatalf("seed v6 embedding space: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO agent_memory.embedding_projection_targets (
+			embedding_space, state, enqueue_new
+		) VALUES ('upgrade-space', 'serving', false)`); err != nil {
+		t.Fatalf("seed invalid v6 serving target: %v", err)
+	}
+	if err := migrator.MigrateTo(ctx, 7); err == nil {
+		t.Fatal("v7 migration accepted serving target with enqueue_new=false")
+	}
+	var version int32
+	if err := conn.QueryRow(ctx, `SELECT version FROM public.agent_memory_schema_version`).Scan(&version); err != nil {
+		t.Fatalf("read failed upgrade version: %v", err)
+	}
+	if version != 6 {
+		t.Fatalf("failed upgrade version=%d, want 6", version)
+	}
+	if _, err := conn.Exec(ctx, `
+		UPDATE agent_memory.embedding_projection_targets
+		SET enqueue_new=true
+		WHERE embedding_space='upgrade-space'`); err != nil {
+		t.Fatalf("explicitly repair invalid v6 fixture: %v", err)
+	}
+	if err := migrator.MigrateTo(ctx, 7); err != nil {
+		t.Fatalf("migrate valid serving target to v7: %v", err)
+	}
+}
+
+func assertPromotionReceiptConstraints(t *testing.T, ctx context.Context, conn *pgx.Conn) {
+	t.Helper()
+	assertColumnCollation(t, ctx, conn, "embedding_projection_promotions", []string{
+		"operation_id", "from_embedding_space", "to_embedding_space",
+	})
+	assertDeleteRule(t, ctx, conn, "embedding_projection_promotions_from_space_fk", "RESTRICT")
+	assertDeleteRule(t, ctx, conn, "embedding_projection_promotions_to_space_fk", "RESTRICT")
 }
 
 func assertProjectionDeploymentState(t *testing.T, ctx context.Context, conn *pgx.Conn) {

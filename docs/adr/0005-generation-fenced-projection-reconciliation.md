@@ -33,7 +33,7 @@ Backfill is accepted only while the target is an enqueue-enabled `shadow` or `se
 - Audit completion is a point-in-time database coverage statement for one target and one stable generation. Finalization holds the deployment singleton exclusively during its O(N) scan and document-hash recomputation, so approvals pause for this offline gate. It is not proof that the embedding model is semantically good, that a remote provider deleted prior requests, or that the server uses the vector.
 - Backfill creates worker input; operators must run the worker and repeat audit. Dead/cancelled blockers require an explicit operational decision rather than an automatic terminal-state retry.
 - Provider I/O already received before erasure cannot be recalled by reconciliation. PostgreSQL deletion prevents later persistence and removes jobs/vectors, but provider retention, garbage collection, and process-memory zeroization remain separate contracts.
-- Serving-space promotion, atomic query-path invalidation, dense/hybrid server retrieval, RRF/reranking, and ANN remain unimplemented. The default server continues to use PostgreSQL FTS.
+- Serving-space promotion was intentionally outside this reconciliation decision and is now implemented separately by ADR 0006 with a fresh full coverage proof. Dense/hybrid server retrieval, RRF/reranking, and ANN remain unimplemented. The default server continues to use PostgreSQL FTS.
 
 ## Executable evidence
 
@@ -50,4 +50,4 @@ These are local database/process claims. They are not production promotion, load
 - **Treat a completed scan as valid after target mutation:** can mix old and new deployment membership in one coverage claim.
 - **Persist a content-bearing checkpoint:** increases deletion and credential exposure without adding correctness; rescanning the idempotent natural key is sufficient.
 - **Reset dead or cancelled jobs automatically:** hides terminal/provider/operator decisions and can create an unbounded retry loop.
-- **Promote a target when audit reaches zero blockers:** promotion also requires an explicit atomic read-path decision and retrieval acceptance gate; reconciliation alone cannot authorize it.
+- **Promote through ADR 0006 when audit reaches zero blockers:** promotion repeats the full database coverage proof under its own atomic gate; reconciliation alone cannot authorize it, and server read-path acceptance remains separate.

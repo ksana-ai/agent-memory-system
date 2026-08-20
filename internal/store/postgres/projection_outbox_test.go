@@ -51,6 +51,9 @@ func TestValidateRegisterProjectionTargetRejectsInvalidValues(t *testing.T) {
 		{name: "bad fingerprint", mutate: func(value *RegisterProjectionTargetCommand) { value.Space.ModelFingerprint = "not-a-sha" }},
 		{name: "missing space created at", mutate: func(value *RegisterProjectionTargetCommand) { value.Space.CreatedAt = time.Time{} }},
 		{name: "invalid state", mutate: func(value *RegisterProjectionTargetCommand) { value.State = "warming" }},
+		{name: "initial serving", mutate: func(value *RegisterProjectionTargetCommand) {
+			value.State, value.EnqueueNew = ProjectionTargetServing, true
+		}},
 		{name: "blocked enqueues", mutate: func(value *RegisterProjectionTargetCommand) {
 			value.State, value.EnqueueNew = ProjectionTargetBlocked, true
 		}},

@@ -699,11 +699,24 @@ func registerReconciliationTarget(
 	space := uniqueProjectionRepositorySpace("reconciliation_" + label)
 	cleanupProjectionRepositorySpaces(t, databaseURL, space)
 	createdAt := time.Now().UTC().Truncate(time.Microsecond)
+	registeredState := state
+	if state == postgres.ProjectionTargetServing {
+		// This fixture exercises serving-only reconciliation effects, not the
+		// promotion protocol. Public registration deliberately rejects serving.
+		registeredState = postgres.ProjectionTargetShadow
+	}
 	if _, err := storage.RegisterProjectionTarget(
 		context.Background(),
-		projectionRepositoryRegistration(space, state, enqueueNew, createdAt),
+		projectionRepositoryRegistration(space, registeredState, enqueueNew, createdAt),
 	); err != nil {
 		t.Fatalf("register reconciliation target: %v", err)
+	}
+	if state == postgres.ProjectionTargetServing {
+		execReconciliationSQL(t, databaseURL, `
+			UPDATE agent_memory.embedding_projection_targets
+			SET state = 'serving', enqueue_new = true,
+			    updated_at = GREATEST(updated_at, clock_timestamp())
+			WHERE embedding_space = $1`, space)
 	}
 	return space
 }
