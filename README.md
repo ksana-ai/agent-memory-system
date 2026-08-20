@@ -2,7 +2,7 @@
 
 A Go-native, evidence-first memory service for agents. It separates raw conversation evidence, untrusted memory proposals, reviewed/versioned memory cards, and the Context Pack assembled for one request.
 
-> **Current status: durable PostgreSQL vertical slice plus measured lexical and dense retrieval components.** The server binary still uses PostgreSQL FTS. Approved cards atomically enqueue content-free projection jobs, a separate leased/fenced worker can project them through local LM Studio into pgvector, a DB-only reconciler can idempotently backfill and audit one stable target generation, and a coverage-backed transaction can atomically promote one serving space. Dense/hybrid server retrieval is not implemented. An independently selectable evaluation arm measures exact cosine retrieval without presenting that evaluator path—or a serving-space selection—as the production server.
+> **Current status: durable PostgreSQL vertical slice with explicit FTS, dense, and hybrid server modes.** PostgreSQL FTS remains the default and does not depend on LM Studio. After durable projection, reconciliation, and coverage-backed serving promotion, an operator may explicitly pin that serving space for exact dense retrieval or strict RRF hybrid retrieval. These are accepted local component/process paths, not a production deployment, quality guarantee, ANN/load result, or availability SLA.
 
 ## Why this project exists
 
@@ -14,17 +14,21 @@ flowchart LR
     C --> R{Explicit review}
     R -->|reject| X[Not serviceable]
     R -->|approve| M[Versioned memory card]
-    M --> S[Scoped PostgreSQL FTS server]
+    M --> S[Scoped PostgreSQL FTS default]
     M --> O[Transactional projection outbox]
     M --> B[DB-only backfill / coverage audit]
     B --> O
     O --> W[Leased and fenced worker]
     W --> V[LM Studio + pgvector]
     V --> G[Coverage-backed serving promotion]
+    G --> D[Serving-only exact dense]
+    S --> H[Strict RRF hybrid]
+    D --> H
     M -. evaluator-only projection .-> V
     E --> P[Context Pack with sources]
     S --> P
-    V -. evaluation arm only .-> P
+    D --> P
+    H --> P
 ```
 
 The implemented invariants are:
@@ -36,6 +40,7 @@ The implemented invariants are:
 - The worker claims one job at a time using a database-clock lease, releases all database locks before embedding HTTP, and atomically fences vector persistence with job acknowledgement.
 - Backfill scans a stable deployment generation in bounded pages and repairs only PostgreSQL jobs/derived vectors; audit does not mutate projection/card state and fails unless aggregate coverage is complete.
 - Promotion revalidates every serviceable card at one PostgreSQL cutoff, compare-and-swaps the serving target, advances every live scope revision plus the deployment generation, and records an immutable idempotency receipt in one transaction.
+- Dense mode pins that serving target and generation across a public-probe/query embedding call and a short exact-cosine transaction; hybrid mode combines the same dense branch with FTS using strict versioned RRF and no silent fallback.
 - Each worker attempt binds the public probe and versioned card document in one bounded embedding request; a public-probe behavior mismatch is terminal for that job. This detects probe-visible drift, not full model identity or weights.
 - PostgreSQL keys, foreign keys, and queries carry both `tenant_id` and `user_id`.
 - A Context Pack uses one request-time `as_of` value and returns only active, unexpired cards with the source evidence needed to audit them.
@@ -52,10 +57,11 @@ The implemented invariants are:
 | Deletion propagation | DELETE commits, PostgreSQL FTS returns nothing, a third server process still sees nothing, and database tables are inspected; pgvector rows and projection jobs cascade with their cards, and a later worker run cannot recreate them | PostgreSQL backup/PITR deletion policy is not implemented; deletion cannot recall provider I/O or physically erase a document already copied into worker memory |
 | Time-based serviceability | Optional absolute `expires_at` is copied from candidate to card; equality is expired and is checked in storage, retrieval, and Context Pack assembly | Expiration does not delete data or change the card's lifecycle status |
 | Offline evaluation | Legacy 8-case smoke fixture plus separate 30-case lifecycle and 30-case semantic-extension datasets; four-arm manifests report quality, deterministic marginal intervals, policy, provenance, latency smoke, and cleanup | Uses authored cards and synthetic queries; the first-look extension is now a regression set and does not measure extraction, concurrent load, answer quality, or production traffic |
-| Durable projection handoff | Approval enqueue plus a DB-clock `SKIP LOCKED` worker; fenced retry/dead-letter/finalize transitions; atomic vector+ack; fake-provider kill/restart recovery; real LM Studio process projection; erasure and stale-worker tests | One job/concurrency in v1; no server dense/hybrid read path |
+| Durable projection handoff | Approval enqueue plus a DB-clock `SKIP LOCKED` worker; fenced retry/dead-letter/finalize transitions; atomic vector+ack; fake-provider kill/restart recovery; real LM Studio process projection; erasure and stale-worker tests | One job/concurrency in v1 |
 | Projection coverage | Generation-fenced, bounded, DB-only backfill and non-mutating aggregate audit; killed-process restart, natural-key idempotency, and deletion propagation tests | Audit startup may apply migrations and its bounded scans take row locks; pending/leased/retry require the worker; dead/cancelled are explicit blockers; promotion is a separate full revalidation |
-| Serving-space deployment | Explicit expected-source compare-and-swap, O(N) coverage proof, atomic target/revision/generation switch, durable UUID receipt, rollback through the same gate, and actual CLI restart recovery after the probe endpoint is removed | Changes PostgreSQL deployment state only; server remains FTS, the public probe is behavior drift detection rather than model identity or a quality/SLA claim, and v1 has no receipt-retention/deletion API |
-| Dense retrieval component | Versioned card documents, a bounded OpenAI-compatible embeddings client, `vector(1024)` projections, exact scoped cosine search, lifecycle cleanup, and a real-component evaluation arm | Evaluator still projects synchronously; the server remains FTS and has no hybrid fusion or ANN index |
+| Serving-space deployment | Explicit expected-source compare-and-swap, O(N) coverage proof, atomic target/revision/generation switch, durable UUID receipt, rollback through the same gate, and actual CLI restart recovery after the probe endpoint is removed | The public probe is behavior drift detection rather than model identity or a quality/SLA claim; v1 has no receipt-retention/deletion API |
+| Online dense/hybrid retrieval | Explicit process mode and serving-space pin, per-query probe/generation fence, exact scoped cosine SQL, strict RRF `k=60`, fixed 503/504 failures, real server-process deletion/restart tests | FTS remains the default; no implicit fallback, ANN, load/SLA, remote-provider privacy, or production-traffic claim |
+| Dense retrieval evaluation | Versioned card documents, bounded LM Studio client, exact pgvector component arm, frozen datasets, lifecycle cleanup, and deterministic manifests | The historical vector arm projects synchronously; production-path serving/hybrid arms are reported separately and still use synthetic authored cards |
 
 The in-memory adapter remains only for fast unit tests and deterministic offline evaluation. `cmd/server` has no in-memory fallback and fails fast when PostgreSQL is unavailable.
 
@@ -88,6 +94,16 @@ Check process liveness and database readiness separately:
 curl -sS http://127.0.0.1:8080/healthz
 curl -sS http://127.0.0.1:8080/readyz
 ```
+
+The omitted/default mode is FTS. Only after the durable worker, reconciliation, and promotion gates have completed should a server explicitly select the promoted space:
+
+```bash
+export SERVER_EXPECTED_SERVING_SPACE="$PROJECTION_WORKER_EMBEDDING_SPACE"
+make server-dense  # serving-only exact cosine
+make server-hybrid # strict FTS+dense RRF, no fallback
+```
+
+Dense/hybrid startup requires the LM Studio URL/model variables shown in `.env.example`. `/healthz` stays a liveness check if the endpoint or serving pin fails; `/readyz` and Context Pack requests fail with fixed 503 responses. The request body cannot choose another retrieval mode or space. FTS mode does not read or probe the embedding settings.
 
 Stop the container without deleting data:
 
@@ -134,7 +150,7 @@ make projection-promote
 
 Generate a fresh UUID for every intended transition; the value above is only a shape example. Empty databases fail closed unless the operator deliberately sets `PROJECTION_PROMOTER_ALLOW_EMPTY=true`. For a new operation the CLI first sends the fixed public probe, requires its derived immutable space to equal the explicit destination, then asks PostgreSQL to recheck every serviceable card. The atomic transaction moves the previous serving target back to enqueue-enabled shadow, promotes the destination, advances all live scope revisions and the deployment generation, and stores aggregate counts/times in an immutable receipt. This is an offline O(N) gate that can pause approvals and scope writers.
 
-If the CLI loses the first result after PostgreSQL commits, retry the exact same UUID/source/destination/empty choice. The CLI returns the durable receipt before contacting LM Studio, so crash recovery does not depend on endpoint availability and does not advance revisions or generation twice. That replay proves only the historical database commit, not current endpoint health. A first execution's probe is a fixed-input behavior fingerprint—not a model-weights hash—and occurs before the database transaction, leaving a probe-to-commit time-of-check/time-of-use window. Rollback is a new promotion with source/destination reversed, a fresh UUID, the endpoint configured for that destination, and the same full coverage gate. Receipts have no public deletion API in v1; target retirement retains them, and their foreign keys prevent referenced space deletion. A future retention policy would explicitly shorten the corresponding UUID replay window. Promotion still does not change the server retrieval path: `cmd/server` remains on PostgreSQL FTS until dense/hybrid integration is separately implemented and accepted.
+If the CLI loses the first result after PostgreSQL commits, retry the exact same UUID/source/destination/empty choice. The CLI returns the durable receipt before contacting LM Studio, so crash recovery does not depend on endpoint availability and does not advance revisions or generation twice. That replay proves only the historical database commit, not current endpoint health. A first execution's probe is a fixed-input behavior fingerprint—not a model-weights hash—and occurs before the database transaction, leaving a probe-to-commit time-of-check/time-of-use window. Rollback is a new promotion with source/destination reversed, a fresh UUID, the endpoint configured for that destination, and the same full coverage gate. Receipts have no public deletion API in v1; target retirement retains them, and their foreign keys prevent referenced space deletion. A future retention policy would explicitly shorten the corresponding UUID replay window. Promotion changes durable selection metadata; an explicit dense/hybrid server mode still pins and revalidates that selection on every query, while the default server remains FTS.
 
 ## Exercise the lifecycle
 
@@ -213,6 +229,7 @@ make test-outbox-integration # three repeated migration, transaction, restart, a
 make verify-worker      # fenced worker repository/process recovery + real LM Studio projection
 make verify-reconciliation # generation-fenced DB backfill/audit + killed-process restart/deletion
 make verify-promotion   # atomic serving swap + CLI receipt replay with fake public probe
+make verify-serving-retrieval # serving SQL + dense/hybrid server process/delete/restart gate
 make eval               # deterministic lexical smoke evaluation
 make eval-v2            # 30-case no-memory vs reviewed-card BM25 policy gate
 make eval-postgres      # same 30 cases across no-memory, Go BM25, and real PG FTS
@@ -261,7 +278,7 @@ internal/domain/             Evidence, candidate, card, context, deletion types
 internal/embedding/          Bounded LM Studio client and versioned card documents
 internal/migrations/         Tern runner and versioned SQL
 internal/projectionworker/   Bounded leased/fenced embedding orchestration
-internal/retrieval/          Deterministic in-memory BM25 baseline
+internal/retrieval/          BM25 plus serving-pinned dense and strict RRF hybrid
 internal/store/memstore/     Unit/evaluation test double
 internal/store/postgres/     Durable transactions, FTS, pgvector, eval isolation, tests
 compose.yaml                 Local PostgreSQL/pgvector service
@@ -269,8 +286,8 @@ compose.yaml                 Local PostgreSQL/pgvector service
 
 ## Roadmap
 
-1. Add a revision-pinned dense/hybrid server read path that resolves only the serving space, fails closed on provider/deployment drift, and keeps PostgreSQL FTS as the explicit default until acceptance.
-2. Compare reciprocal-rank fusion/reranking against the retained FTS and dense ranking errors; add ANN only after a scale/load benchmark justifies its recall tradeoff.
+1. Compare the accepted serving-path dense and fixed RRF hybrid modes on a separately designed quality gate; do not tune on the now-known regression cases and do not make a promotion claim from synthetic results.
+2. Add ANN only after a scale/load and tenant-filtered recall benchmark justifies its tradeoff against exact cosine.
 3. Add an independently sourced, blinded evaluation cohort and paired comparison before making a model-promotion claim.
 4. Add authenticated principals, authorization, PII policy, rate limits, redacted observability, backup/restore, and backup-aware erasure.
 5. Add a structured model extractor and verifier with explicit human-escalation policy.

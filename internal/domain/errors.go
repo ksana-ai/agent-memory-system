@@ -8,4 +8,5 @@ var (
 	ErrInvariant     = errors.New("invariant violation")
 	ErrNotFound      = errors.New("not found")
 	ErrScopeMismatch = errors.New("tenant or user scope mismatch")
+	ErrUnavailable   = errors.New("unavailable")
 )

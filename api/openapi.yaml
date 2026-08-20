@@ -24,16 +24,18 @@ paths:
   /readyz:
     get:
       operationId: readiness
-      description: Queries PostgreSQL and reports whether the process can serve requests.
+      description: >-
+        Queries PostgreSQL and, for an explicitly configured dense or hybrid
+        mode, verifies the serving-space pin and embedding public probe.
       responses:
         "200":
-          description: PostgreSQL is reachable
+          description: All dependencies for the configured retrieval mode are reachable and match the serving pin
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ReadinessStatus"
         "503":
-          description: PostgreSQL is unavailable or did not respond before the readiness timeout
+          description: PostgreSQL or a configured dense/hybrid dependency is unavailable, mismatched, or timed out
           content:
             application/json:
               schema:
@@ -127,6 +129,8 @@ paths:
                 $ref: "#/components/schemas/ContextPack"
         "400": {$ref: "#/components/responses/BadRequest"}
         "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/RetrievalUnavailable"}
+        "504": {$ref: "#/components/responses/RequestTimeout"}
   /v1/users/{user_id}:
     delete:
       operationId: forgetUser
@@ -175,6 +179,16 @@ components:
       content:
         application/json:
           schema: {$ref: "#/components/schemas/Error"}
+    RetrievalUnavailable:
+      description: The configured dense or hybrid retrieval dependency is unavailable
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    RequestTimeout:
+      description: Retrieval did not complete before the request deadline
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
   schemas:
     HealthStatus:
       type: object
@@ -182,7 +196,7 @@ components:
       required: [status, phase, storage]
       properties:
         status: {type: string, const: ok}
-        phase: {type: string, const: postgres-fts}
+        phase: {type: string, enum: [postgres-fts, postgres-dense, postgres-hybrid-rrf]}
         storage: {type: string, const: postgresql}
     ReadinessStatus:
       type: object

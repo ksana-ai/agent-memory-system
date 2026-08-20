@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/puddle/v2"
 	"github.com/kai443/go-agent-memory-system/internal/domain"
 )
 
@@ -864,6 +867,9 @@ func mapProjectionPostgresError(action string, err error) error {
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("%s: %w", action, domain.ErrNotFound)
 	}
+	if isProjectionDatabaseUnavailable(err) {
+		return fmt.Errorf("%s: database unavailable: %w", action, domain.ErrUnavailable)
+	}
 	var postgresError *pgconn.PgError
 	if errors.As(err, &postgresError) {
 		switch postgresError.Code {
@@ -878,4 +884,23 @@ func mapProjectionPostgresError(action string, err error) error {
 		}
 	}
 	return fmt.Errorf("%s: database operation failed: %w", action, domain.ErrInvariant)
+}
+
+func isProjectionDatabaseUnavailable(err error) bool {
+	if errors.Is(err, puddle.ErrClosedPool) ||
+		errors.Is(err, puddle.ErrNotAvailable) ||
+		errors.Is(err, pgconn.ErrConnClosed) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		pgconn.SafeToRetry(err) ||
+		pgconn.Timeout(err) {
+		return true
+	}
+
+	var connectError *pgconn.ConnectError
+	if errors.As(err, &connectError) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError)
 }

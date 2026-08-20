@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -137,6 +139,66 @@ func TestHTTPRejectsExplicitZeroContextLimit(t *testing.T) {
 	}
 }
 
+func TestHTTPMapsRetrievalUnavailableWithoutLeakingCause(t *testing.T) {
+	storage := memstore.New()
+	service, err := app.New(storage, unavailableRetriever{})
+	if err != nil {
+		t.Fatalf("new unavailable service: %v", err)
+	}
+	handler, err := api.NewHandler(service)
+	if err != nil {
+		t.Fatalf("new unavailable handler: %v", err)
+	}
+
+	response := perform(t, handler.Routes(), http.MethodPost, "/v1/context-packs", `{"query":"seat","limit":5}`, true)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	decodeResponse(t, response, &body)
+	if body.Error.Code != "retrieval_unavailable" || body.Error.Message != "retrieval is temporarily unavailable" {
+		t.Fatalf("unexpected unavailable response: %#v", body)
+	}
+	if strings.Contains(response.Body.String(), "provider-secret") {
+		t.Fatalf("unavailable response leaked implementation detail: %s", response.Body.String())
+	}
+}
+
+func TestHTTPMapsRetrievalDeadlineWithoutLeakingCause(t *testing.T) {
+	storage := memstore.New()
+	service, err := app.New(storage, deadlineRetriever{})
+	if err != nil {
+		t.Fatalf("new deadline service: %v", err)
+	}
+	handler, err := api.NewHandler(service)
+	if err != nil {
+		t.Fatalf("new deadline handler: %v", err)
+	}
+
+	response := perform(t, handler.Routes(), http.MethodPost, "/v1/context-packs", `{"query":"seat","limit":5}`, true)
+	if response.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	decodeResponse(t, response, &body)
+	if body.Error.Code != "request_timeout" || body.Error.Message != "request timed out" {
+		t.Fatalf("unexpected timeout response: %#v", body)
+	}
+	if strings.Contains(response.Body.String(), "provider-secret") {
+		t.Fatalf("timeout response leaked implementation detail: %s", response.Body.String())
+	}
+}
+
 func TestHealthIsLiveWithoutProbingStorage(t *testing.T) {
 	readiness := &readinessStub{err: errors.New("database unavailable")}
 	routes := newRoutesWithOptions(
@@ -232,6 +294,18 @@ func newRoutesWithOptions(t *testing.T, options ...api.HandlerOption) http.Handl
 type readinessStub struct {
 	err   error
 	calls int
+}
+
+type unavailableRetriever struct{}
+
+func (unavailableRetriever) Search(context.Context, string, string, string, int, time.Time) ([]domain.SearchHit, error) {
+	return nil, fmt.Errorf("provider-secret: %w", domain.ErrUnavailable)
+}
+
+type deadlineRetriever struct{}
+
+func (deadlineRetriever) Search(context.Context, string, string, string, int, time.Time) ([]domain.SearchHit, error) {
+	return nil, fmt.Errorf("provider-secret: %w", context.DeadlineExceeded)
 }
 
 func (stub *readinessStub) Ping(context.Context) error {

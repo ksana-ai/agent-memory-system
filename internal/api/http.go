@@ -337,6 +337,10 @@ func writeError(writer http.ResponseWriter, err error) {
 		status, code, message = http.StatusNotFound, "not_found", "resource not found"
 	case errors.Is(err, domain.ErrConflict):
 		status, code, message = http.StatusConflict, "conflict", err.Error()
+	case errors.Is(err, domain.ErrUnavailable):
+		status, code, message = http.StatusServiceUnavailable, "retrieval_unavailable", "retrieval is temporarily unavailable"
+	case errors.Is(err, context.DeadlineExceeded):
+		status, code, message = http.StatusGatewayTimeout, "request_timeout", "request timed out"
 	case errors.Is(err, context.Canceled):
 		status, code, message = http.StatusRequestTimeout, "request_canceled", "request canceled"
 	}

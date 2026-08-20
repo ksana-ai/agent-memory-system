@@ -42,7 +42,7 @@ The single monotonic `context_revision` keeps its lifecycle semantics. Approval/
 - External embedding latency and failure do not extend the approval transaction.
 - PostgreSQL remains the primary deletion boundary; card deletion cascades to jobs and vectors. The worker enforces lease owner/version fencing and revalidates lifecycle state before atomically writing a vector and acknowledging success.
 - Model aliases alone are insufficient. Workers and query processes must pin the expected behavior fingerprint and derived embedding-space ID.
-- The HTTP server remains on PostgreSQL FTS until backfill, reconciliation, coverage, and an atomic serving-space promotion procedure pass their own acceptance gate. Worker recovery and process-level deletion tests do not authorize an implicit dense fallback or a default retrieval-mode change.
+- The HTTP server remains on PostgreSQL FTS until backfill, reconciliation, coverage, and an atomic serving-space promotion procedure pass their own acceptance gate. ADRs 0005–0007 later satisfy those separate implementation gates and add explicit opt-in modes; they retain FTS as the default and never authorize an implicit dense fallback.
 - A committed deletion cannot retract an embedding request already sent to an external provider or prove deletion from provider logs or caches. Remote-provider retention and deletion require a separate contract; the current trusted development endpoint is loopback LM Studio.
 
 ## Rejected alternatives

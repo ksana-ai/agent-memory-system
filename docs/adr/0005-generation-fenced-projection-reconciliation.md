@@ -33,7 +33,7 @@ Backfill is accepted only while the target is an enqueue-enabled `shadow` or `se
 - Audit completion is a point-in-time database coverage statement for one target and one stable generation. Finalization holds the deployment singleton exclusively during its O(N) scan and document-hash recomputation, so approvals pause for this offline gate. It is not proof that the embedding model is semantically good, that a remote provider deleted prior requests, or that the server uses the vector.
 - Backfill creates worker input; operators must run the worker and repeat audit. Dead/cancelled blockers require an explicit operational decision rather than an automatic terminal-state retry.
 - Provider I/O already received before erasure cannot be recalled by reconciliation. PostgreSQL deletion prevents later persistence and removes jobs/vectors, but provider retention, garbage collection, and process-memory zeroization remain separate contracts.
-- Serving-space promotion was intentionally outside this reconciliation decision and is now implemented separately by ADR 0006 with a fresh full coverage proof. Dense/hybrid server retrieval, RRF/reranking, and ANN remain unimplemented. The default server continues to use PostgreSQL FTS.
+- Serving-space promotion was intentionally outside this reconciliation decision and is implemented separately by ADR 0006 with a fresh full coverage proof. ADR 0007 subsequently adds explicit serving-pinned dense and fixed RRF hybrid server modes; FTS remains the default and ANN remains unimplemented.
 
 ## Executable evidence
 

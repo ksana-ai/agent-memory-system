@@ -4,25 +4,25 @@
 
 This service owns reviewed cross-session user memory. It does not own an agent's current prompt, tool policy, skills, or run checkpoint. Those Context Engineering and Harness components may consume a Context Pack, but their state does not become durable memory automatically.
 
-The current server runtime path is:
+The current server runtime paths are selected once per process:
 
 ```text
 HTTP API
    │
    ▼
-Application service ─────► Retriever port ────┐
-   │                                          │
-   ▼                                          ▼
-Store port ──────────────► PostgreSQL adapter / FTS
-                                      │
-                                      ▼
-                             Docker PostgreSQL 18
-                             + pgvector extension
+Application service ─────► Retriever port ────┬──► PostgreSQL FTS (default)
+   │                                          ├──► serving-pinned exact dense
+   ▼                                          └──► strict FTS+dense RRF hybrid
+Store port ───────────────────────────────► PostgreSQL adapter
+                                                  │
+                                                  ▼
+                                         Docker PostgreSQL 18
+                                         + pgvector extension
 ```
 
-The server uses PostgreSQL full-text search directly. Migration 003 adds a STORED generated `tsvector`: memory key has weight A, value B, category/person/relationship C, and backstory D. A partial GIN index covers active cards. Plain query text is tokenized with the fixed `simple` configuration; the resulting lexemes are safely quoted and OR-combined before `ts_rank_cd` ranking. Scope, active status, and expiration are filtered in the same SQL statement, followed by deterministic `created_at`/ID tie-breaking.
+The server defaults to PostgreSQL full-text search. Migration 003 adds a STORED generated `tsvector`: memory key has weight A, value B, category/person/relationship C, and backstory D. A partial GIN index covers active cards. Plain query text is tokenized with the fixed `simple` configuration; the resulting lexemes are safely quoted and OR-combined before `ts_rank_cd` ranking. Scope, active status, and expiration are filtered in the same SQL statement, followed by deterministic `created_at`/ID tie-breaking. FTS mode never reads or probes the embedding endpoint.
 
-Dense retrieval remains an independently selectable evaluator component, not the server path. Reviewed cards now have durable projection, coverage, and serving-selection paths:
+Reviewed cards have durable projection, coverage, serving-selection, and explicit query paths:
 
 ```text
 review transaction commits
@@ -37,8 +37,9 @@ versioned card document ──HTTP──► LM Studio text-embedding-bge-m3
                                              ▼
                                       atomic serving promotion
 
-query ──HTTP embedding──────────────────────────► exact pgvector cosine search
-                                                   evaluator only
+query ──[public probe, raw query] embedding─────► serving-fenced exact cosine
+                                                    │
+PostgreSQL FTS ───────────────────────── strict RRF┘
 ```
 
 The diagram above is the evaluator's synchronous path. The durable worker path is:
@@ -53,7 +54,7 @@ pending/retry job ── short DB-clock lease tx ──► [public probe, card d
                          fenced vector + succeeded acknowledgement tx
 ```
 
-External embedding HTTP calls never run while a PostgreSQL transaction or scope lock is held. `cmd/projection-worker` claims one job at a time with `FOR UPDATE SKIP LOCKED`, sends one bounded two-input request, verifies the probe vector against the explicitly configured immutable space, and then finalizes the vector and acknowledgement in one transaction. `cmd/projection-reconciler` never calls the embedding endpoint: it scans database coverage in bounded pages, repairs durable work in backfill mode, and reports aggregate coverage in an audit mode that does not mutate projection/card state. Audit startup can still apply migrations, and its bounded queries take row locks. `cmd/projection-promoter` performs its fixed public probe before a first promotion transaction, then atomically swaps serving metadata only after a fresh full database coverage proof. The server still needs a separately accepted dense/hybrid read path before it can consume that serving selection.
+External embedding HTTP calls never run while a PostgreSQL transaction or scope lock is held. `cmd/projection-worker` claims one job at a time with `FOR UPDATE SKIP LOCKED`, sends one bounded two-input request, verifies the probe vector against the explicitly configured immutable space, and then finalizes the vector and acknowledgement in one transaction. `cmd/projection-reconciler` never calls the embedding endpoint: it scans database coverage in bounded pages, repairs durable work in backfill mode, and reports aggregate coverage in an audit mode that does not mutate projection/card state. Audit startup can still apply migrations, and its bounded queries take row locks. `cmd/projection-promoter` performs its fixed public probe before a first promotion transaction, then atomically swaps serving metadata only after a fresh full database coverage proof. An opt-in dense/hybrid server reads that serving selection, validates the public probe outside a transaction, and uses the observed space plus generation as compare-and-swap preconditions for the short search transaction.
 
 Migration 005 implements the durable handoff. An approved card and its content-free `embedding_projection_jobs` rows commit together for every registered target whose state is `shadow` or `serving` and whose `enqueue_new` flag is enabled. The target registry points only to immutable `embedding_spaces` definitions. Jobs retain scope/card/space identifiers, expected memory version, scheduling state, lease-fencing fields, and bounded error codes; they do not retain card text, vectors, endpoint URLs, credentials, response bodies, or raw provider errors. The worker uses PostgreSQL `clock_timestamp()` as the authority for claim, lease expiry, retry scheduling, card expiry, and finalization. Process-local monotonic elapsed time only bounds local request waiting and result use; after the conservative lease budget the worker discards the result and leaves durable recovery to PostgreSQL. Cancelling a request does not prove that the provider stopped computation or removed its logs.
 
@@ -143,7 +144,7 @@ The direct projection API above remains the evaluator's synchronous component pa
 4. Reacquire locks in scope → target → job → card order, validate the database-clock lease, active version, expiration, target state, document hash, and space.
 5. Upsert the vector and mark the job succeeded in one transaction. A material serving projection advances the context revision; a shadow projection does not.
 
-Retry and dead-letter transitions carry only a closed error code and the lease owner/version fence. `blocked` pauses new claims and requeues a successful in-flight result. A retirement transaction cancels every pending, retry, or leased job after serializing with approvals; old lease tokens then fail. Claim/finalize cancels invalid expiration states, while supersession and erasure delete jobs by scoped lifecycle transaction. Repeated process-crash deliveries are dead-lettered at the configured maximum before the next job is selected. A stale process cannot restore data after supersession or erasure. Serving membership now changes only through the coverage-backed promotion transaction, but the server continues to use FTS until a dense/hybrid query path is separately implemented and accepted.
+Retry and dead-letter transitions carry only a closed error code and the lease owner/version fence. `blocked` pauses new claims and requeues a successful in-flight result. A retirement transaction cancels every pending, retry, or leased job after serializing with approvals; old lease tokens then fail. Claim/finalize cancels invalid expiration states, while supersession and erasure delete jobs by scoped lifecycle transaction. Repeated process-crash deliveries are dead-lettered at the configured maximum before the next job is selected. A stale process cannot restore data after supersession or erasure. Serving membership changes only through the coverage-backed promotion transaction; dense/hybrid server modes consume only that membership, never a caller-selected or shadow space.
 
 ### Backfill and coverage reconciliation
 
@@ -167,11 +168,23 @@ The promotion transaction takes the deployment singleton exclusively, locks ever
 
 Once the proof succeeds, the same transaction changes the old serving target to enqueue-enabled shadow, changes the destination to enqueue-enabled serving, advances every live scope's context revision once, advances the deployment generation once, and inserts an immutable aggregate receipt. The receipt stores no scope/card identifiers or content. Exact store retries return it without repeating state changes. This O(N) offline gate can pause approvals and scope writers; a future scale optimization needs another snapshot protocol rather than a weaker atomic claim.
 
-The promoted target is durable selection metadata only. `cmd/server` still calls PostgreSQL FTS and does not yet resolve or pin the serving vector space. Promotion does not claim relevance quality, provider availability, model identity, ANN performance, or production deployment.
+The promoted target is durable selection metadata, not an instruction to change a running process automatically. The default `cmd/server` still calls PostgreSQL FTS. An operator must explicitly select dense or hybrid mode and pin the expected serving space; each query then verifies that space and the deployment generation. Promotion does not claim relevance quality, provider availability, model identity, ANN performance, or production deployment.
 
 Promotion receipts have no public deletion API in v1. Target retirement retains both the immutable receipt and referenced space definition, and receipt foreign keys prevent deletion of a referenced space. Any future retention policy must explicitly trade historical audit/replay duration against cleanup; deleting a receipt would end the corresponding operation UUID's idempotent replay window.
 
-Erasure and supersession remain authoritative: their scoped foreign keys delete the card's job/vector, and a later backfill scan has no eligible card from which to recreate them. This prevents database resurrection but cannot recall an embedding request already received by a provider or prove removal from provider logs/process memory. A complete audit is database coverage evidence only; it does not promote the space or change the server's FTS path.
+Erasure and supersession remain authoritative: their scoped foreign keys delete the card's job/vector, and a later backfill scan has no eligible card from which to recreate them. This prevents database resurrection but cannot recall an embedding request already received by a provider or prove removal from provider logs/process memory. A complete audit is database coverage evidence only; it does not promote the space or change a running server's configured retrieval mode.
+
+### Explicit online dense and hybrid retrieval
+
+`SERVER_RETRIEVAL_MODE` is a process-level choice. Blank or `fts` selects the lexical baseline; `dense` selects serving-only exact cosine; `hybrid` runs FTS and that dense branch concurrently. Dense/hybrid additionally require the LM Studio URL/model and `SERVER_EXPECTED_SERVING_SPACE`. No Context Pack field can select another mode or space, and neither dense nor hybrid silently falls back to FTS.
+
+Before embedding query text, the dense retriever reads the unique serving target plus deployment generation and checks the operator pin and immutable provider/model/dimension/document/query metadata. It then sends `[ProbeTextV1, trimmed raw query]` through the bounded client outside every database transaction. The returned public probe must re-derive the same immutable space. A short explicit `READ COMMITTED` transaction subsequently locks the deployment singleton and serving target shared, compares the original generation and space, then performs exact cosine ranking. Promotion takes the conflicting exclusive deployment lock, so a rotation during provider I/O produces a fixed unavailable result instead of mixed-space search.
+
+The ranking SQL itself requires the target to remain enqueue-enabled `serving`; the natural job to be `succeeded` for the exact card version; a matching vector; an in-scope active card whose expiration is strictly after `as_of`; and at least one ordered source. This is intentionally stricter than accepting any row from `memory_embeddings`.
+
+Hybrid uses `rrf-v1`: each branch requests `min(100, max(20, 4*limit))` candidates, then adds `1/(60+rank)` per memory ID. Fused score descending, best branch rank ascending, card creation time descending, and memory ID ascending form the stable order. Every raw branch hit is validated before fusion; out-of-scope, non-serviceable, source-less, duplicate, over-limit, or cross-branch payload disagreement is an invariant failure. A failure in either branch fails the request. This preserves one named ranking policy instead of converting an outage into an unrecorded fallback experiment.
+
+`/healthz` remains liveness and does not probe PostgreSQL or LM Studio. Dense/hybrid `/readyz` requires PostgreSQL plus an instantaneous serving-pin and public-probe check. Context Pack maps dependency and deployment drift to fixed `503 retrieval_unavailable`, and deadline expiry to fixed `504 request_timeout`; neither response includes provider or connection details. The public probe is one-input behavior evidence rather than a weights identity, and exact cosine is a local scale choice rather than an ANN or load claim.
 
 ## Erasure and read consistency
 
@@ -183,7 +196,7 @@ Erasure and supersession remain authoritative: their scoped foreign keys delete 
 4. evidence events;
 5. then increments the retained revision and records `last_deleted_at`.
 
-Because the FTS document is a generated column on `memory_cards`, deletion reaches the server retrieval path in the same commit. Dense rows and projection jobs use scoped composite foreign keys with `ON DELETE CASCADE`; evaluation cleanup refuses to remove its content-free scope tombstone while either remains. Server process tests prove FTS data remains absent after restart. Worker process tests kill a process holding a durable lease, recover it with a new process and higher fence version, then prove `ForgetUser` removes its job/vector and a third worker run cannot resurrect them. Other tenant/user scopes are retained as controls.
+Because the FTS document is a generated column on `memory_cards`, deletion reaches the lexical server path in the same commit. Dense rows and projection jobs use scoped composite foreign keys with `ON DELETE CASCADE`; evaluation cleanup refuses to remove its content-free scope tombstone while either remains. Server process tests create and promote a real durable projection, query it through dense and hybrid modes, erase it, restart, and prove lifecycle/job/vector rows remain absent. Worker process tests separately kill a process holding a durable lease, recover it with a new process and higher fence version, then prove `ForgetUser` removes its job/vector and a third worker run cannot resurrect them. Other tenant/user scopes are retained as controls.
 
 `BuildContext` compares the scope revision before and after its multi-statement retrieval and retries when it observes a concurrent change. This is an optimistic consistency guard, not a single serializable read transaction. The current propagation guarantee applies to requests begun after erasure commits; an HTTP request already in flight at commit is not proven to be a linearizable privacy barrier.
 
@@ -203,9 +216,9 @@ The initial migration installs pgvector. A second migration adds candidate/card 
 - The reviewer ID and reason are audit fields supplied by the caller; reviewer independence is not verified.
 - Extracted content is data, never an instruction to execute tools.
 - Database constraints and scoped SQL are the enforcement layer; prompt instructions are not a security boundary.
-- `/healthz` proves only that the process is alive. `/readyz` separately pings PostgreSQL.
-- Retrieval scores are lexical ranking values, not truth confidence. The fixed `simple` configuration is a reproducible baseline, not language-aware semantic retrieval; the lifecycle fixture already exposes paraphrase and multilingual misses.
-- Memory-card and query text leave the process when the dense evaluator or projection worker calls its configured LM Studio endpoint. The client accepts only absolute HTTP(S) URLs without userinfo/query/fragment, follows no redirects, enforces timeout/input/batch/response limits, validates model/index/dimension/finite nonzero vectors, performs no implicit retry, and does not expose input, response bodies, or endpoints in errors or manifests. The worker continuously checks a fixed public probe in the same batch as each card document, while durable retry happens only through a new fenced lease. Plain HTTP is intended only for the trusted loopback development endpoint; any future remote endpoint must use HTTPS and needs an explicit authentication/secrets design.
+- `/healthz` proves only that the process is alive. `/readyz` separately checks PostgreSQL and, for dense/hybrid mode, the configured serving pin plus public-probe behavior.
+- Retrieval scores are ranking values, not truth confidence. FTS `ts_rank_cd`, cosine similarity, and RRF fused scores have different semantics and must not be interpreted as calibrated confidence.
+- Memory-card text leaves the process when the dense evaluator or projection worker calls its configured LM Studio endpoint; query text also leaves in online dense/hybrid mode. The client accepts only absolute HTTP(S) URLs without userinfo/query/fragment, follows no redirects, enforces timeout/input/batch/response limits, validates model/index/dimension/finite nonzero vectors, performs no implicit retry, and does not expose input, response bodies, or endpoints in errors or manifests. The worker continuously checks a fixed public probe in the same batch as each card document; the server does the same with each raw query, while durable worker retry happens only through a new fenced lease. Plain HTTP is intended only for the trusted loopback development endpoint; any future remote endpoint must use HTTPS and needs an explicit authentication/secrets design.
 - A first promotion sends only the fixed public probe before its database transaction; receipt replay sends nothing. The canonical operation UUID and non-secret space identifiers are logged with aggregate counts/generations/times, but DSNs, endpoints, model names, scope/card identifiers, card content, vectors, and provider responses are not. Space and operation identifiers are control-plane values by contract, not places for user content or secrets; generic storage validation does not prove that every historical space identifier is a hash.
 - Erasure prevents stale vector persistence but cannot recall provider I/O already in flight or physically erase a card document already copied into worker memory. The worker bounds local request waiting and refuses late persistence; it does not promise heap-memory zeroization or provider-side cancellation, retention, or deletion. The current development endpoint is loopback-only.
-- Cosine similarity is relevance ranking, not truth confidence. The vector arm is local component evidence over authored reviewed cards, not proof of extraction quality or production behavior.
+- Cosine similarity and RRF are relevance rankings, not truth confidence. Server-process and evaluator evidence uses authored reviewed cards and is not proof of extraction quality, load behavior, remote-provider privacy, or production traffic.

@@ -29,7 +29,7 @@ EVAL_VECTOR_V2_MANIFEST := $(CURDIR)/artifacts/eval/memory-lifecycle-v2-postgres
 EVAL_SEMANTIC_V1_MANIFEST := $(CURDIR)/artifacts/eval/memory-semantic-extension-v1-postgres-vector-latest.json
 GO_FILES := $(shell find . -path './.cache' -prune -o -path './.git' -prune -o -name '*.go' -type f -print)
 
-.PHONY: build build-eval build-projection-promoter build-projection-reconciler build-projection-worker build-server db-down db-up eval eval-postgres eval-postgres-recorded eval-recorded eval-semantic eval-semantic-recorded eval-v2 eval-vector eval-vector-recorded fmt fmt-check migrate projection-backfill projection-promote projection-reconcile projection-target-register projection-worker projection-worker-probe semantic-frozen server test test-integration test-outbox-integration test-promotion-integration test-race test-reconciliation-integration test-vector-integration test-worker-integration test-worker-vector-integration verify verify-postgres verify-promotion verify-reconciliation verify-semantic verify-vector verify-worker vet
+.PHONY: build build-eval build-projection-promoter build-projection-reconciler build-projection-worker build-server db-down db-up eval eval-postgres eval-postgres-recorded eval-recorded eval-semantic eval-semantic-recorded eval-v2 eval-vector eval-vector-recorded fmt fmt-check migrate projection-backfill projection-promote projection-reconcile projection-target-register projection-worker projection-worker-probe semantic-frozen server server-dense server-hybrid test test-integration test-outbox-integration test-promotion-integration test-race test-reconciliation-integration test-serving-retrieval test-serving-retrieval-integration test-vector-integration test-worker-integration test-worker-vector-integration verify verify-postgres verify-promotion verify-reconciliation verify-semantic verify-serving-retrieval verify-vector verify-worker vet
 
 build:
 	$(GO) build ./...
@@ -126,6 +126,15 @@ test-promotion-integration: db-up build-projection-promoter
 	@TEST_PROJECTION_PROMOTER_BINARY='$(PROJECTION_PROMOTER_BINARY)' \
 		$(GO) test -p 1 -race -tags=integration -count=1 ./internal/migrations ./internal/store/postgres ./cmd/projection-promoter
 
+test-serving-retrieval:
+	$(GO) test -race ./internal/retrieval ./internal/api ./internal/store/postgres ./cmd/server
+
+test-serving-retrieval-integration: db-up build-server
+	@TEST_SERVER_BINARY='$(SERVER_BINARY)' \
+		$(GO) test -p 1 -race -tags=integration -count=1 \
+		-run 'Test(SearchServingVector|ServerServingDense|ServerDenseFails)' \
+		./internal/store/postgres ./cmd/server
+
 test-race:
 	$(GO) test -race ./...
 
@@ -139,6 +148,14 @@ migrate: db-up
 
 server: db-up
 	@$(GO) run ./cmd/server
+
+server-dense: db-up
+	@test -n "$$SERVER_EXPECTED_SERVING_SPACE" || { echo 'SERVER_EXPECTED_SERVING_SPACE is required' >&2; exit 1; }
+	@SERVER_RETRIEVAL_MODE=dense $(GO) run ./cmd/server
+
+server-hybrid: db-up
+	@test -n "$$SERVER_EXPECTED_SERVING_SPACE" || { echo 'SERVER_EXPECTED_SERVING_SPACE is required' >&2; exit 1; }
+	@SERVER_RETRIEVAL_MODE=hybrid $(GO) run ./cmd/server
 
 projection-worker-probe:
 	@PROJECTION_WORKER_MODE=probe $(GO) run ./cmd/projection-worker
@@ -169,3 +186,5 @@ verify-worker: test-worker-integration test-worker-vector-integration
 verify-reconciliation: test-reconciliation-integration
 
 verify-promotion: test-promotion-integration
+
+verify-serving-retrieval: fmt-check vet test-serving-retrieval test-serving-retrieval-integration

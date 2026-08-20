@@ -3,12 +3,15 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/puddle/v2"
 	"github.com/kai443/go-agent-memory-system/internal/domain"
 )
 
@@ -201,6 +204,63 @@ func TestProjectionRepositoryErrorsDoNotExposeRawDatabaseDetails(t *testing.T) {
 	if err := mapProjectionPostgresError("cancelled operation", context.Canceled); !errors.Is(err, context.Canceled) {
 		t.Fatalf("context cancellation error=%v, want context.Canceled", err)
 	}
+}
+
+func TestProjectionRepositoryAvailabilityErrorsAreRedacted(t *testing.T) {
+	const secret = "postgres://user:super-secret@db.example/agent_memory"
+	tests := []error{
+		projectionSafeToRetryError{message: "dial " + secret},
+		projectionNetworkError{message: "read " + secret},
+		fmt.Errorf("closed connection %s: %w", secret, pgconn.ErrConnClosed),
+		fmt.Errorf("unexpected EOF %s: %w", secret, io.ErrUnexpectedEOF),
+		fmt.Errorf("closed pool %s: %w", secret, puddle.ErrClosedPool),
+		fmt.Errorf("pool unavailable %s: %w", secret, puddle.ErrNotAvailable),
+	}
+	for _, raw := range tests {
+		mapped := mapProjectionPostgresError("read serving projection", raw)
+		if !errors.Is(mapped, domain.ErrUnavailable) {
+			t.Fatalf("mapped error=%v, want unavailable", mapped)
+		}
+		if errors.Is(mapped, domain.ErrInvariant) {
+			t.Fatalf("mapped error=%v, do not want invariant", mapped)
+		}
+		if strings.Contains(mapped.Error(), secret) || strings.Contains(mapped.Error(), "super-secret") {
+			t.Fatalf("mapped error exposed raw database details: %q", mapped)
+		}
+	}
+
+	unknown := mapProjectionPostgresError("read serving projection", errors.New("unknown driver failure "+secret))
+	if !errors.Is(unknown, domain.ErrInvariant) || errors.Is(unknown, domain.ErrUnavailable) {
+		t.Fatalf("unknown driver error=%v, want invariant and not unavailable", unknown)
+	}
+}
+
+type projectionSafeToRetryError struct {
+	message string
+}
+
+func (err projectionSafeToRetryError) Error() string {
+	return err.message
+}
+
+func (projectionSafeToRetryError) SafeToRetry() bool {
+	return true
+}
+
+type projectionNetworkError struct {
+	message string
+}
+
+func (err projectionNetworkError) Error() string {
+	return err.message
+}
+
+func (projectionNetworkError) Timeout() bool {
+	return false
+}
+
+func (projectionNetworkError) Temporary() bool {
+	return true
 }
 
 func TestProjectionJobPublicShapeHasNoRawPayloadOrSecretFields(t *testing.T) {
