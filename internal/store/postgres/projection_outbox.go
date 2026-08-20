@@ -14,9 +14,8 @@ import (
 )
 
 // ProjectionTargetState controls whether a registered embedding space accepts
-// new projection jobs and whether it is eligible for serving. This repository
-// only persists the deployment intent; workers and serving code enforce it in
-// later phases.
+// new projection jobs and whether it is eligible for serving. Retirement is
+// terminal and atomically cancels every nonterminal job for the space.
 type ProjectionTargetState string
 
 const (
@@ -69,7 +68,7 @@ type SetProjectionTargetCommand struct {
 }
 
 // ProjectionJobState is the durable projection state exposed for operational
-// acceptance. This phase intentionally provides no claim or finalize methods.
+// acceptance and fenced worker transitions.
 type ProjectionJobState string
 
 const (
@@ -255,6 +254,11 @@ func (s *Store) SetProjectionTarget(ctx context.Context, command SetProjectionTa
 		if current.State != normalized.State || current.EnqueueNew != normalized.EnqueueNew {
 			return ProjectionTarget{}, fmt.Errorf("projection target timestamp has conflicting values: %w", domain.ErrConflict)
 		}
+		if normalized.State == ProjectionTargetRetired {
+			if err := cancelRetiredProjectionJobs(ctx, tx, normalized.EmbeddingSpace); err != nil {
+				return ProjectionTarget{}, err
+			}
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return ProjectionTarget{}, mapProjectionPostgresError("commit projection target no-op", err)
 		}
@@ -273,6 +277,11 @@ func (s *Store) SetProjectionTarget(ctx context.Context, command SetProjectionTa
 	if err != nil {
 		return ProjectionTarget{}, mapProjectionPostgresError("update projection target", err)
 	}
+	if normalized.State == ProjectionTargetRetired {
+		if err := cancelRetiredProjectionJobs(ctx, tx, normalized.EmbeddingSpace); err != nil {
+			return ProjectionTarget{}, err
+		}
+	}
 	target, err := readProjectionTarget(ctx, tx, normalized.EmbeddingSpace, false)
 	if err != nil {
 		return ProjectionTarget{}, err
@@ -281,6 +290,22 @@ func (s *Store) SetProjectionTarget(ctx context.Context, command SetProjectionTa
 		return ProjectionTarget{}, mapProjectionPostgresError("commit projection target update", err)
 	}
 	return target, nil
+}
+
+func cancelRetiredProjectionJobs(ctx context.Context, tx pgx.Tx, embeddingSpace string) error {
+	operationAt, err := projectionDatabaseTime(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE agent_memory.embedding_projection_jobs
+		SET state = 'cancelled', lease_owner = NULL, lease_until = NULL,
+		    updated_at = $2, completed_at = $2
+		WHERE embedding_space = $1
+		  AND state IN ('pending', 'retry', 'leased')`, embeddingSpace, operationAt); err != nil {
+		return mapProjectionPostgresError("cancel retired projection jobs", err)
+	}
+	return nil
 }
 
 // ProjectionTargetBySpace loads one target and its immutable space metadata.

@@ -23,7 +23,7 @@ When at least one target has `enqueue_new=true`, candidate approval inserts the 
 
 Jobs contain identifiers, expected memory version, scheduling state, lease fencing data, and a stable redacted error code. They do not contain memory text, vectors, endpoint URLs, credentials, response bodies, or raw provider errors.
 
-A later worker will claim jobs in a short `FOR UPDATE SKIP LOCKED` transaction, release all database locks before calling the embedding endpoint, and finalize the vector plus job acknowledgement atomically. Finalization must reacquire the existing scope row, validate the lease owner/version, target, active card, expected version, expiry, document hash, and embedding space. A stale worker may not recreate a projection after supersession or erasure.
+The projection worker claims jobs in a short `FOR UPDATE SKIP LOCKED` transaction, releases all database locks before calling the embedding endpoint, and finalizes the vector plus job acknowledgement atomically. Finalization reacquires the existing scope row, validates the lease owner/version, target, active card, expected version, expiry, document hash, and embedding space. A stale worker may not recreate a projection after supersession or erasure. The detailed runtime decision is recorded in ADR 0004.
 
 Target rotation is explicit:
 
@@ -34,15 +34,15 @@ Target rotation is explicit:
 5. promote at most one target to serving;
 6. retire the prior target separately.
 
-The single monotonic `context_revision` keeps its lifecycle semantics. Approval/supersession and `ForgetUser` each advance it once. Queue bookkeeping and shadow projection do not advance it. A future serving projection advances it only when an atomic finalize materially changes a query-visible vector; duplicate delivery is a no-op.
+The single monotonic `context_revision` keeps its lifecycle semantics. Approval/supersession and `ForgetUser` each advance it once. Queue bookkeeping and shadow projection do not advance it. A serving worker projection advances it only when an atomic finalize materially changes a query-visible vector; duplicate delivery is a no-op.
 
 ## Consequences
 
-- A projection target that is eligible in the approval enqueue statement's database snapshot receives a durable job in the same commit. Targets enabled later require backfill and reconciliation.
+- A projection target that is eligible in the approval's locked target snapshot receives a durable job in the same commit. Targets enabled later require backfill and reconciliation.
 - External embedding latency and failure do not extend the approval transaction.
-- PostgreSQL remains the primary deletion boundary; card deletion cascades to jobs and vectors. The schema provides lease-fencing fields, and the future worker must enforce them before it can claim protection against late restoration.
+- PostgreSQL remains the primary deletion boundary; card deletion cascades to jobs and vectors. The worker enforces lease owner/version fencing and revalidates lifecycle state before atomically writing a vector and acknowledging success.
 - Model aliases alone are insufficient. Workers and query processes must pin the expected behavior fingerprint and derived embedding-space ID.
-- The HTTP server remains on PostgreSQL FTS until worker recovery, backfill, reconciliation, coverage, and process-level deletion tests pass. This ADR does not authorize an implicit dense fallback or a default retrieval-mode change.
+- The HTTP server remains on PostgreSQL FTS until backfill, reconciliation, coverage, and an atomic serving-space promotion procedure pass their own acceptance gate. Worker recovery and process-level deletion tests do not authorize an implicit dense fallback or a default retrieval-mode change.
 - A committed deletion cannot retract an embedding request already sent to an external provider or prove deletion from provider logs or caches. Remote-provider retention and deletion require a separate contract; the current trusted development endpoint is loopback LM Studio.
 
 ## Rejected alternatives

@@ -30,12 +30,31 @@ const (
 )
 
 var (
-	ErrInvalidConfig    = errors.New("invalid embedding client configuration")
-	ErrInvalidInput     = errors.New("invalid embedding input")
-	ErrRequestFailed    = errors.New("embedding request failed")
-	ErrResponseTooLarge = errors.New("embedding response exceeds size limit")
-	ErrInvalidResponse  = errors.New("invalid embedding response")
+	ErrInvalidConfig     = errors.New("invalid embedding client configuration")
+	ErrInvalidInput      = errors.New("invalid embedding input")
+	ErrRequestFailed     = errors.New("embedding request failed")
+	ErrResponseTooLarge  = errors.New("embedding response exceeds size limit")
+	ErrInvalidResponse   = errors.New("invalid embedding response")
+	ErrModelMismatch     = errors.New("embedding model mismatch")
+	ErrDimensionMismatch = errors.New("embedding vector dimension mismatch")
+	ErrNonFiniteVector   = errors.New("embedding vector contains a non-finite value")
+	ErrZeroVector        = errors.New("embedding vector is all zero")
 )
+
+// HTTPStatusError exposes only the provider's numeric status so callers can
+// distinguish retryable availability failures from permanent rejection. It
+// deliberately retains neither the endpoint nor the response body.
+type HTTPStatusError struct {
+	StatusCode int
+}
+
+func (err *HTTPStatusError) Error() string {
+	return fmt.Sprintf("%s: HTTP status %d", ErrInvalidResponse, err.StatusCode)
+}
+
+func (err *HTTPStatusError) Unwrap() error {
+	return ErrInvalidResponse
+}
 
 // Config is the complete network and output contract for Client. A zero
 // ExpectedDimension selects DefaultDimension; a zero Timeout selects
@@ -222,6 +241,11 @@ func (client *Client) Embed(ctx context.Context, inputs []string) ([][]float32, 
 		return nil, ErrRequestFailed
 	}
 	defer response.Body.Close()
+	// Error response bodies are untrusted, unnecessary for classification, and
+	// may be arbitrarily large. Return only the status without reading them.
+	if response.StatusCode != http.StatusOK {
+		return nil, &HTTPStatusError{StatusCode: response.StatusCode}
+	}
 
 	responseBody, tooLarge, err := readLimited(response.Body, client.maxResponseBytes)
 	if err != nil {
@@ -230,10 +254,6 @@ func (client *Client) Embed(ctx context.Context, inputs []string) ([][]float32, 
 	if tooLarge {
 		return nil, ErrResponseTooLarge
 	}
-	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: HTTP status %d", ErrInvalidResponse, response.StatusCode)
-	}
-
 	var decoded embeddingsResponse
 	if err := json.Unmarshal(responseBody, &decoded); err != nil {
 		// The decoder error is intentionally discarded because it can quote
@@ -245,7 +265,7 @@ func (client *Client) Embed(ctx context.Context, inputs []string) ([][]float32, 
 
 func (client *Client) validateResponse(response embeddingsResponse, inputCount int) ([][]float32, error) {
 	if response.Model != client.model {
-		return nil, fmt.Errorf("%w: model mismatch", ErrInvalidResponse)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, ErrModelMismatch)
 	}
 	if len(response.Data) != inputCount {
 		return nil, fmt.Errorf("%w: result count mismatch", ErrInvalidResponse)
@@ -267,24 +287,24 @@ func (client *Client) validateResponse(response embeddingsResponse, inputCount i
 		seen[index] = true
 
 		if len(item.Embedding) != client.dimension {
-			return nil, fmt.Errorf("%w: vector dimension mismatch", ErrInvalidResponse)
+			return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, ErrDimensionMismatch)
 		}
 		vector := make([]float32, client.dimension)
 		nonzero := false
 		for position, number := range item.Embedding {
 			value, err := strconv.ParseFloat(string(number), 64)
 			if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
-				return nil, fmt.Errorf("%w: vector contains a non-finite value", ErrInvalidResponse)
+				return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, ErrNonFiniteVector)
 			}
 			value32 := float32(value)
 			if math.IsNaN(float64(value32)) || math.IsInf(float64(value32), 0) {
-				return nil, fmt.Errorf("%w: vector contains a non-finite value", ErrInvalidResponse)
+				return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, ErrNonFiniteVector)
 			}
 			vector[position] = value32
 			nonzero = nonzero || value32 != 0
 		}
 		if !nonzero {
-			return nil, fmt.Errorf("%w: vector must not be all zero", ErrInvalidResponse)
+			return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, ErrZeroVector)
 		}
 		vectors[index] = vector
 	}

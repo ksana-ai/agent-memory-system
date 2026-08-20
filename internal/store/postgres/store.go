@@ -265,6 +265,14 @@ func (s *Store) ReviewCandidate(ctx context.Context, command domainstore.Candida
 	default:
 		return domain.MemoryCandidate{}, nil, fmt.Errorf("review decision %q: %w", command.Review.Decision, domain.ErrInvalid)
 	}
+	// Freeze the eligible deployment set before touching any existing jobs.
+	// SetProjectionTarget takes the conflicting target lock before cancelling
+	// jobs, so this target -> job order prevents approval/retirement deadlocks.
+	// A target registered after this statement is handled by backfill.
+	eligibleProjectionSpaces, err := lockEligibleProjectionTargets(ctx, tx)
+	if err != nil {
+		return domain.MemoryCandidate{}, nil, err
+	}
 
 	card := domain.MemoryCard{
 		ID:             command.MemoryID,
@@ -399,19 +407,16 @@ func (s *Store) ReviewCandidate(ctx context.Context, command domainstore.Candida
 	}
 
 	// Projection targets are registered independently by the embedding worker.
-	// Selecting them inside the approval transaction keeps the lifecycle card
-	// and its durable projection handoff atomic without coupling the Store
-	// interface to one live embedding endpoint. A target registered after this
-	// snapshot is covered by the separate backfill/reconciliation path.
+	// The locked deployment snapshot keeps the lifecycle card and its durable
+	// handoff atomic without coupling the Store interface to a live endpoint.
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO agent_memory.embedding_projection_jobs (
 			tenant_id, user_id, memory_id, embedding_space, expected_memory_version
 		)
-		SELECT $1, $2, $3, target.embedding_space, $4
-		FROM agent_memory.embedding_projection_targets AS target
-		WHERE target.enqueue_new
-		  AND target.state IN ('shadow', 'serving')`,
-		card.TenantID, card.UserID, card.ID, card.Version,
+		SELECT $1, $2, $3, eligible.embedding_space, $4
+		FROM unnest($5::text[]) AS eligible(embedding_space)
+		ORDER BY eligible.embedding_space`,
+		card.TenantID, card.UserID, card.ID, card.Version, eligibleProjectionSpaces,
 	); err != nil {
 		return domain.MemoryCandidate{}, nil, mapProjectionPostgresError("enqueue memory embedding projection", err)
 	}
@@ -447,6 +452,33 @@ func (s *Store) ReviewCandidate(ctx context.Context, command domainstore.Candida
 		return domain.MemoryCandidate{}, nil, mapPostgresError("commit candidate approval", err)
 	}
 	return candidate, &card, nil
+}
+
+func lockEligibleProjectionTargets(ctx context.Context, tx pgx.Tx) ([]string, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT target.embedding_space
+		FROM agent_memory.embedding_projection_targets AS target
+		WHERE target.enqueue_new
+		  AND target.state IN ('shadow', 'serving')
+		ORDER BY target.embedding_space
+		FOR SHARE OF target`)
+	if err != nil {
+		return nil, mapProjectionPostgresError("lock eligible projection targets", err)
+	}
+	defer rows.Close()
+
+	spaces := make([]string, 0)
+	for rows.Next() {
+		var space string
+		if err := rows.Scan(&space); err != nil {
+			return nil, mapProjectionPostgresError("scan eligible projection target", err)
+		}
+		spaces = append(spaces, space)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapProjectionPostgresError("iterate eligible projection targets", err)
+	}
+	return spaces, nil
 }
 
 func (s *Store) ListServiceableMemories(ctx context.Context, tenantID, userID string, asOf time.Time) ([]domain.MemoryCard, error) {

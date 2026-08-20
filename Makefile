@@ -18,6 +18,7 @@ LMSTUDIO_EMBEDDING_MODEL ?= text-embedding-bge-m3
 export LMSTUDIO_EMBEDDINGS_URL LMSTUDIO_EMBEDDING_MODEL
 SERVER_BINARY := $(CURDIR)/bin/agent-memory-server
 EVAL_BINARY := $(CURDIR)/bin/agent-memory-eval
+PROJECTION_WORKER_BINARY := $(CURDIR)/bin/agent-memory-projection-worker
 EVAL_V2_DATASET := $(CURDIR)/datasets/memory-lifecycle-v2.json
 EVAL_SEMANTIC_V1_DATASET := $(CURDIR)/datasets/memory-semantic-extension-v1.json
 EVAL_V2_MANIFEST := $(CURDIR)/artifacts/eval/memory-lifecycle-v2-latest.json
@@ -26,7 +27,7 @@ EVAL_VECTOR_V2_MANIFEST := $(CURDIR)/artifacts/eval/memory-lifecycle-v2-postgres
 EVAL_SEMANTIC_V1_MANIFEST := $(CURDIR)/artifacts/eval/memory-semantic-extension-v1-postgres-vector-latest.json
 GO_FILES := $(shell find . -path './.cache' -prune -o -path './.git' -prune -o -name '*.go' -type f -print)
 
-.PHONY: build build-eval build-server db-down db-up eval eval-postgres eval-postgres-recorded eval-recorded eval-semantic eval-semantic-recorded eval-v2 eval-vector eval-vector-recorded fmt fmt-check migrate semantic-frozen server test test-integration test-outbox-integration test-race test-vector-integration verify verify-postgres verify-semantic verify-vector vet
+.PHONY: build build-eval build-projection-worker build-server db-down db-up eval eval-postgres eval-postgres-recorded eval-recorded eval-semantic eval-semantic-recorded eval-v2 eval-vector eval-vector-recorded fmt fmt-check migrate projection-target-register projection-worker projection-worker-probe semantic-frozen server test test-integration test-outbox-integration test-race test-vector-integration test-worker-integration test-worker-vector-integration verify verify-postgres verify-semantic verify-vector verify-worker vet
 
 build:
 	$(GO) build ./...
@@ -38,6 +39,10 @@ build-server:
 build-eval:
 	mkdir -p $(CURDIR)/bin
 	$(GO) build -o $(EVAL_BINARY) ./cmd/eval
+
+build-projection-worker:
+	mkdir -p $(CURDIR)/bin
+	$(GO) build -o $(PROJECTION_WORKER_BINARY) ./cmd/projection-worker
 
 db-up:
 	docker compose up -d --wait postgres
@@ -95,6 +100,14 @@ test-outbox-integration: migrate build-server
 test-vector-integration: migrate build-eval
 	@$(GO) test -p 1 -race -tags='integration vector' -count=1 ./internal/embedding ./internal/store/postgres ./internal/eval
 
+test-worker-integration: db-up build-projection-worker
+	@TEST_PROJECTION_WORKER_BINARY='$(PROJECTION_WORKER_BINARY)' \
+		$(GO) test -p 1 -race -tags=integration -count=1 ./internal/store/postgres ./internal/projectionworker ./cmd/projection-worker
+
+test-worker-vector-integration: db-up build-projection-worker
+	@TEST_PROJECTION_WORKER_BINARY='$(PROJECTION_WORKER_BINARY)' \
+		$(GO) test -p 1 -race -tags='integration vector' -count=1 ./internal/embedding ./cmd/projection-worker
+
 test-race:
 	$(GO) test -race ./...
 
@@ -109,8 +122,19 @@ migrate: db-up
 server: db-up
 	@$(GO) run ./cmd/server
 
+projection-worker-probe:
+	@PROJECTION_WORKER_MODE=probe $(GO) run ./cmd/projection-worker
+
+projection-target-register: db-up
+	@PROJECTION_WORKER_MODE=register-shadow $(GO) run ./cmd/projection-worker
+
+projection-worker: db-up
+	@PROJECTION_WORKER_MODE=run $(GO) run ./cmd/projection-worker
+
 verify-postgres: test-integration eval-postgres
 
 verify-vector: test-vector-integration eval-vector
 
 verify-semantic: test-vector-integration eval-semantic
+
+verify-worker: test-worker-integration test-worker-vector-integration

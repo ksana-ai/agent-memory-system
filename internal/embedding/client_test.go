@@ -181,16 +181,17 @@ func TestClientRejectsBatchAndInputByteLimitsBeforeSending(t *testing.T) {
 
 func TestClientRejectsResponseContractViolations(t *testing.T) {
 	tests := []struct {
-		name   string
-		inputs []string
-		body   func() any
+		name     string
+		inputs   []string
+		body     func() any
+		wantKind error
 	}{
 		{
-			name: "model mismatch", inputs: []string{"one"},
+			name: "model mismatch", inputs: []string{"one"}, wantKind: ErrModelMismatch,
 			body: func() any { return responseBody("different-model", result(0, testVector(DefaultDimension, 1))) },
 		},
 		{
-			name: "missing model", inputs: []string{"one"},
+			name: "missing model", inputs: []string{"one"}, wantKind: ErrModelMismatch,
 			body: func() any { return responseBody("", result(0, testVector(DefaultDimension, 1))) },
 		},
 		{
@@ -214,11 +215,11 @@ func TestClientRejectsResponseContractViolations(t *testing.T) {
 			body: func() any { return responseBody(testModel, result(1, testVector(DefaultDimension, 1))) },
 		},
 		{
-			name: "dimension mismatch", inputs: []string{"one"},
+			name: "dimension mismatch", inputs: []string{"one"}, wantKind: ErrDimensionMismatch,
 			body: func() any { return responseBody(testModel, result(0, testVector(DefaultDimension-1, 1))) },
 		},
 		{
-			name: "all zero", inputs: []string{"one"},
+			name: "all zero", inputs: []string{"one"}, wantKind: ErrZeroVector,
 			body: func() any { return responseBody(testModel, result(0, make([]float64, DefaultDimension))) },
 		},
 	}
@@ -235,20 +236,24 @@ func TestClientRejectsResponseContractViolations(t *testing.T) {
 			if !errors.Is(err, ErrInvalidResponse) {
 				t.Fatalf("error = %v, want ErrInvalidResponse", err)
 			}
+			if test.wantKind != nil && !errors.Is(err, test.wantKind) {
+				t.Fatalf("error = %v, want kind %v", err, test.wantKind)
+			}
 		})
 	}
 }
 
 func TestClientRejectsNaNInfinityAndFloat32OverflowFromHTTP(t *testing.T) {
 	tests := []struct {
-		name  string
-		value string
+		name          string
+		value         string
+		wantNonFinite bool
 	}{
 		{name: "NaN", value: "NaN"},
 		{name: "positive infinity", value: "Infinity"},
 		{name: "negative infinity", value: "-Infinity"},
-		{name: "float64 overflow", value: "1e400"},
-		{name: "float32 overflow", value: "1e100"},
+		{name: "float64 overflow", value: "1e400", wantNonFinite: true},
+		{name: "float32 overflow", value: "1e100", wantNonFinite: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -265,6 +270,9 @@ func TestClientRejectsNaNInfinityAndFloat32OverflowFromHTTP(t *testing.T) {
 			_, err := client.Embed(context.Background(), []string{"sensitive input"})
 			if !errors.Is(err, ErrInvalidResponse) {
 				t.Fatalf("error = %v, want ErrInvalidResponse", err)
+			}
+			if test.wantNonFinite && !errors.Is(err, ErrNonFiniteVector) {
+				t.Fatalf("error = %v, want ErrNonFiniteVector", err)
 			}
 			if strings.Contains(err.Error(), "sensitive input") || strings.Contains(err.Error(), test.value) {
 				t.Fatalf("error leaked input or response: %v", err)
@@ -297,6 +305,28 @@ func TestClientRejectsOversizedAndErrorResponsesWithoutBodyLeak(t *testing.T) {
 		_, err := client.Embed(context.Background(), []string{"sensitive-input-body"})
 		if !errors.Is(err, ErrInvalidResponse) || !strings.Contains(err.Error(), "401") {
 			t.Fatalf("error = %v, want sanitized HTTP status", err)
+		}
+		var statusError *HTTPStatusError
+		if !errors.As(err, &statusError) || statusError.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("error = %#v, want typed HTTP status 401", err)
+		}
+		assertNoSecrets(t, err, "sensitive-response-body", "sensitive-input-body")
+	})
+
+	t.Run("oversized retryable non-200 keeps typed status", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+			response.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = response.Write([]byte(strings.Repeat("sensitive-response-body", 20)))
+		}))
+		defer server.Close()
+		client := newTestClient(t, server, Config{MaxResponseBytes: 64})
+		_, err := client.Embed(context.Background(), []string{"sensitive-input-body"})
+		var statusError *HTTPStatusError
+		if !errors.As(err, &statusError) || statusError.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("error = %#v, want typed HTTP status 503", err)
+		}
+		if errors.Is(err, ErrResponseTooLarge) {
+			t.Fatalf("retryable HTTP status was replaced by response-size classification: %v", err)
 		}
 		assertNoSecrets(t, err, "sensitive-response-body", "sensitive-input-body")
 	})
