@@ -1,8 +1,10 @@
 # Go Agent Memory System
 
+[English](README.md) | [中文](README_zh.md)
+
 A Go-native, evidence-first memory service for agents. It separates raw conversation evidence, untrusted memory proposals, reviewed/versioned memory cards, and the Context Pack assembled for one request.
 
-> **Current status: durable PostgreSQL vertical slice with explicit FTS, dense, and hybrid server modes.** PostgreSQL FTS remains the default and does not depend on LM Studio. After durable projection, reconciliation, and coverage-backed serving promotion, an operator may explicitly pin that serving space for exact dense retrieval or strict RRF hybrid retrieval. These are accepted local component/process paths, not a production deployment, quality guarantee, ANN/load result, or availability SLA.
+> **Current status: durable PostgreSQL lifecycle plus an opt-in structured evidence extractor and explicit FTS, dense, and hybrid server modes.** The extractor turns already-persisted evidence into untrusted, source-grounded `pending` candidates; it never approves them. PostgreSQL FTS remains the default retrieval mode and does not depend on either model endpoint. These are accepted local component/process paths, not a production deployment, extraction-quality guarantee, fact verifier, ANN/load result, or availability SLA.
 
 ## Why this project exists
 
@@ -10,7 +12,9 @@ An agent checkpoint answers “where should this run resume?” Agent memory ans
 
 ```mermaid
 flowchart LR
-    E[Append evidence] --> C[Propose candidate]
+    E[Append evidence] --> A[Configured structured extractor]
+    A --> C[Pending candidate]
+    E -. manual compatibility API .-> C
     C --> R{Explicit review}
     R -->|reject| X[Not serviceable]
     R -->|approve| M[Versioned memory card]
@@ -33,6 +37,9 @@ flowchart LR
 
 The implemented invariants are:
 
+- Automatic extraction accepts only persisted evidence IDs from the caller's tenant/user scope; the caller cannot supply candidate business fields through the extraction endpoint.
+- Model I/O runs without a database transaction. The complete response is parsed and validated before one revision-fenced, scope-serialized transaction creates all pending candidates or none.
+- One extraction accepts 1 to 20 unique evidence IDs whose combined content is at most 64 KiB, returns at most 10 candidates, and requires every support quote to be at most 1024 bytes and to occur verbatim in its cited evidence.
 - A candidate is never retrievable before explicit approval.
 - Every candidate references source evidence in the same tenant/user scope.
 - Approval atomically reviews the candidate, supersedes the prior active identity, inserts version `n+1`, and advances the scope revision.
@@ -50,6 +57,7 @@ The implemented invariants are:
 
 | Capability | Executable evidence | Current boundary |
 | --- | --- | --- |
+| Persisted evidence → automatic pending candidates | Strict client/application and real server-process tests with a fake model, plus atomic in-memory/PostgreSQL batch tests; each proposal cites requested same-scope evidence with an exact quote | Quote containment proves mechanical traceability, not semantic entailment or truth; no extraction-quality benchmark or production model claim |
 | Evidence → candidate → review → memory | Unit, HTTP, and real PostgreSQL contract tests | Reviewer ID is caller-supplied; no authentication yet |
 | Transactional conflict versioning | Concurrent approvals produce v1/v2 with one active card; failure-in-the-middle rolls back | Last-approved-wins, not semantic conflict resolution |
 | Tenant/user isolation | Composite database constraints plus cross-scope tests | Scope headers are selectors, not proof of identity |
@@ -63,7 +71,7 @@ The implemented invariants are:
 | Online dense/hybrid retrieval | Explicit process mode and serving-space pin, per-query probe/generation fence, exact scoped cosine SQL, strict RRF `k=60`, fixed 503/504 failures, real server-process deletion/restart tests | FTS remains the default; no implicit fallback, ANN, load/SLA, remote-provider privacy, or production-traffic claim |
 | Dense retrieval evaluation | Versioned card documents, bounded LM Studio client, exact pgvector component arm, frozen datasets, lifecycle cleanup, and deterministic manifests | The historical vector arm projects synchronously; production-path serving/hybrid arms are reported separately and still use synthetic authored cards |
 
-The in-memory adapter remains only for fast unit tests and deterministic offline evaluation. `cmd/server` has no in-memory fallback and fails fast when PostgreSQL is unavailable.
+The in-memory adapter remains only for fast unit tests and deterministic offline evaluation. `cmd/server` has no in-memory fallback and fails fast when PostgreSQL is unavailable. The project does not include chat, ticketing, or other business connectors that collect evidence automatically; it has no automatic approval and no MCP or gRPC service. An application must append evidence explicitly and call the HTTP extraction endpoint, and only the existing review endpoint can make a candidate serviceable.
 
 ## Run locally
 
@@ -72,6 +80,7 @@ Requirements:
 - Go 1.25+
 - Docker Engine with Docker Compose
 - LM Studio serving `text-embedding-bge-m3` on an OpenAI-compatible embeddings endpoint, for vector verification, the projection worker, and a first-time promotion
+- A separately configured OpenAI-compatible chat-completions model only when automatic candidate extraction is enabled; extraction tests use a fake server and do not require a real external model
 
 Make invokes Go with `GOSUMDB=$(GO_CHECKSUM_DB)` and defaults `GO_CHECKSUM_DB` to `sum.golang.org`, so an auto-downloaded Go toolchain is checksum-verified even when the surrounding shell disables the checksum database. Environments using an approved checksum mirror can override that project variable.
 
@@ -116,6 +125,21 @@ Docker Compose uses `pgvector/pgvector:0.8.6-pg18-bookworm`, binds PostgreSQL on
 The default development credentials are listed in `.env.example`. Make does not load `.env`; pass overrides through the shell or on the Make command line. It exports `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_PORT` to Compose and derives the default DSN without printing it. A complete `DATABASE_URL`/`TEST_DATABASE_URL` can also be supplied. The binaries intentionally do not accept DSN flags, keeping credentials out of their advertised process arguments. Changing initialization credentials does not rewrite an existing PostgreSQL volume; recreating that disposable development volume is a separate, destructive operation.
 
 The vector targets read `LMSTUDIO_EMBEDDINGS_URL` and `LMSTUDIO_EMBEDDING_MODEL` from the environment; defaults match the local endpoint shown in `.env.example`. The endpoint is deliberately excluded from process arguments, errors, evaluation descriptors, and manifests. Keep LM Studio running before invoking `make verify-vector`, `make verify-worker`, or a new `make projection-promote`. `make verify-promotion` uses a bounded fake public-probe endpoint and does not require LM Studio.
+
+Automatic candidate extraction is disabled by default and is independent of retrieval mode. Configure it before starting the server:
+
+```bash
+export MEMORY_EXTRACTION_ENABLED=true
+export MEMORY_EXTRACTION_ENDPOINT='http://127.0.0.1:1234/v1/chat/completions'
+export MEMORY_EXTRACTION_MODEL='replace-with-a-structured-output-capable-model'
+export MEMORY_EXTRACTION_AUTH_MODE=none # none or bearer
+export MEMORY_EXTRACTION_TIMEOUT=10s    # default 10s, maximum 120s
+export MEMORY_EXTRACTION_EXTRACTOR_NAME='structured-evidence-extractor'
+export MEMORY_EXTRACTION_EXTRACTOR_VERSION='v1'
+# Set MEMORY_EXTRACTION_BEARER_TOKEN only when AUTH_MODE=bearer.
+```
+
+When disabled, the server does not read the endpoint, model, authentication, timeout, or extractor descriptor settings. When enabled, endpoint, model, extractor name, and extractor version are required; `AUTH_MODE` defaults to `none`, while `bearer` requires `MEMORY_EXTRACTION_BEARER_TOKEN`. The request cannot override any of these process settings. The server extends its write timeout to the extraction timeout plus a five-second response grace. Evidence content is sent to the configured endpoint, so a remote deployment needs an explicit TLS, privacy, retention, and secrets review. `/healthz` remains process liveness and `/readyz` continues to cover PostgreSQL plus the configured retrieval path; it does not probe the optional extractor.
 
 Projection deployment is explicit. Probe the live endpoint, export the exact derived space, register it as a new shadow target, and then start the worker:
 
@@ -169,7 +193,27 @@ curl -sS http://127.0.0.1:8080/v1/evidence \
   }'
 ```
 
-### 2. Propose a memory candidate
+### 2. Extract pending candidates from persisted evidence
+
+Enable and configure the extractor before starting the server, then call only with evidence IDs already stored in this tenant/user scope:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/memory-candidate-extractions \
+  -H 'Content-Type: application/json' \
+  -H 'X-Tenant-ID: demo' \
+  -H 'X-User-ID: user-1' \
+  -d '{"source_event_ids":["evt_demo_1"]}'
+```
+
+The response may contain zero to ten candidates. Every returned candidate is `pending`, records the configured extractor name/version and non-sensitive extraction audit metadata, and references one or more requested evidence events. A supporting quote is validated as an exact substring before persistence, but that mechanical check is not a fact or entailment verifier.
+
+An absent same-scope source returns `404`; a revision race returns `409`; disabled or unavailable extraction returns a fixed `503`; provider refusal or invalid structured output returns a fixed `502`; and extraction timeout returns `504`. These responses do not include the endpoint, bearer token, provider body/refusal, prompt, or evidence content.
+
+Copy one returned candidate ID into the review request below. Before approval, the same Context Pack query returns no item for it.
+
+### 2a. Manual candidate compatibility path
+
+The original endpoint remains available for fixtures, manual operation, and compatibility. It requires the caller to author the candidate fields and is **not** evidence that automatic extraction ran:
 
 ```bash
 curl -sS http://127.0.0.1:8080/v1/memory-candidates \
@@ -191,9 +235,9 @@ curl -sS http://127.0.0.1:8080/v1/memory-candidates \
   }'
 ```
 
-Copy the returned candidate ID into the review request. A pending candidate is not serviceable.
+This path also creates only a pending, non-serviceable candidate.
 
-### 3. Review and promote it
+### 3. Explicitly review and promote it
 
 ```bash
 CANDIDATE_ID='replace-with-returned-candidate-id'
@@ -225,6 +269,7 @@ The full HTTP contract is in [`api/openapi.yaml`](api/openapi.yaml).
 ```bash
 make verify             # format, vet, unit tests, race tests, build
 make verify-postgres    # Docker health, migrations, PG/process tests + real FTS policy gate
+make verify-extraction  # fake-model contract, HTTP/application race, real server process, and PostgreSQL atomicity
 make test-outbox-integration # three repeated migration, transaction, restart, and deletion rounds
 make verify-worker      # fenced worker repository/process recovery + real LM Studio projection
 make verify-reconciliation # generation-fenced DB backfill/audit + killed-process restart/deletion
@@ -276,6 +321,7 @@ internal/api/                Strict HTTP/JSON boundary
 internal/app/                Memory lifecycle application service
 internal/domain/             Evidence, candidate, card, context, deletion types
 internal/embedding/          Bounded LM Studio client and versioned card documents
+internal/extraction/         Provider-neutral structured candidate-extraction client
 internal/migrations/         Tern runner and versioned SQL
 internal/projectionworker/   Bounded leased/fenced embedding orchestration
 internal/retrieval/          BM25 plus serving-pinned dense and strict RRF hybrid
@@ -290,6 +336,8 @@ compose.yaml                 Local PostgreSQL/pgvector service
 2. Add ANN only after a scale/load and tenant-filtered recall benchmark justifies its tradeoff against exact cosine.
 3. Add an independently sourced, blinded evaluation cohort and paired comparison before making a model-promotion claim.
 4. Add authenticated principals, authorization, PII policy, rate limits, redacted observability, backup/restore, and backup-aware erasure.
-5. Add a structured model extractor and verifier with explicit human-escalation policy.
+5. Add independently sourced extraction-quality fixtures, a separately evaluated semantic verifier, and an explicit human-escalation policy. Exact quote containment is not that verifier.
 
 Planned work must not be represented as completed or production-deployed capability.
+
+Business-side automatic evidence collection, chat/ticket connectors, automatic approval, authenticated principals, MCP/direct retrieval, and gRPC are not implemented.

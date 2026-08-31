@@ -9,4 +9,9 @@ var (
 	ErrNotFound      = errors.New("not found")
 	ErrScopeMismatch = errors.New("tenant or user scope mismatch")
 	ErrUnavailable   = errors.New("unavailable")
+
+	ErrExtractionDisabled        = errors.New("candidate extraction disabled")
+	ErrExtractionUnavailable     = errors.New("candidate extraction unavailable")
+	ErrExtractionRejected        = errors.New("candidate extraction rejected")
+	ErrExtractionInvalidResponse = errors.New("invalid candidate extraction response")
 )

@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/kai443/go-agent-memory-system/internal/domain"
+	"github.com/kai443/go-agent-memory-system/internal/extraction"
 	"github.com/kai443/go-agent-memory-system/internal/id"
 	"github.com/kai443/go-agent-memory-system/internal/store"
 )
@@ -42,11 +43,19 @@ func WithIDGenerator(generator IDGenerator) Option {
 	}
 }
 
+func WithCandidateExtractor(extractor extraction.Extractor) Option {
+	return func(service *Service) {
+		service.extractor = extractor
+	}
+}
+
 type Service struct {
-	store     store.Store
-	retriever Retriever
-	now       Clock
-	newID     IDGenerator
+	store               store.Store
+	retriever           Retriever
+	extractor           extraction.Extractor
+	extractorDescriptor extraction.Descriptor
+	now                 Clock
+	newID               IDGenerator
 }
 
 func New(storage store.Store, retriever Retriever, options ...Option) (*Service, error) {
@@ -68,6 +77,13 @@ func New(storage store.Store, retriever Retriever, options ...Option) (*Service,
 	}
 	if service.now == nil || service.newID == nil {
 		return nil, errors.New("clock and id generator are required")
+	}
+	if service.extractor != nil {
+		descriptor := service.extractor.Descriptor()
+		if err := validateExtractionDescriptor(descriptor); err != nil {
+			return nil, fmt.Errorf("configure candidate extractor: %w", err)
+		}
+		service.extractorDescriptor = descriptor
 	}
 	return service, nil
 }
@@ -154,44 +170,7 @@ type ProposeCandidateInput struct {
 }
 
 func (s *Service) ProposeCandidate(ctx context.Context, input ProposeCandidateInput) (domain.MemoryCandidate, error) {
-	if err := validateScope(input.TenantID, input.UserID); err != nil {
-		return domain.MemoryCandidate{}, err
-	}
-	if input.Kind != domain.MemoryKindEpisodic && input.Kind != domain.MemoryKindSemantic && input.Kind != domain.MemoryKindProcedural {
-		return domain.MemoryCandidate{}, invalid("kind must be episodic, semantic, or procedural")
-	}
-	if err := validateRequiredLabel("category", input.Category, 128); err != nil {
-		return domain.MemoryCandidate{}, err
-	}
-	if err := validateRequiredLabel("key", input.Key, 128); err != nil {
-		return domain.MemoryCandidate{}, err
-	}
-	if err := validateRequiredText("value", input.Value, maxValueBytes); err != nil {
-		return domain.MemoryCandidate{}, err
-	}
-	if err := validateOptionalLabel("person", input.Person, 256); err != nil {
-		return domain.MemoryCandidate{}, err
-	}
-	if err := validateOptionalLabel("relationship", input.Relationship, 256); err != nil {
-		return domain.MemoryCandidate{}, err
-	}
-	if err := validateOptionalText("backstory", input.Backstory, 2<<10); err != nil {
-		return domain.MemoryCandidate{}, err
-	}
-	if err := validateRequiredText("extractor", input.Extractor, 128); err != nil {
-		return domain.MemoryCandidate{}, err
-	}
-	if err := validateRequiredText("extractor_version", input.ExtractorVersion, 128); err != nil {
-		return domain.MemoryCandidate{}, err
-	}
-	if err := validateMetadata(input.Metadata); err != nil {
-		return domain.MemoryCandidate{}, err
-	}
-	if input.ExpiresAt != nil && input.ExpiresAt.IsZero() {
-		return domain.MemoryCandidate{}, invalid("expires_at must be a non-zero timestamp")
-	}
-
-	sourceEventIDs, err := uniqueIdentifiers("source_event_ids", input.SourceEventIDs, maxSourceEvents)
+	sourceEventIDs, err := validateCandidateInput(input)
 	if err != nil {
 		return domain.MemoryCandidate{}, err
 	}
@@ -199,6 +178,62 @@ func (s *Service) ProposeCandidate(ctx context.Context, input ProposeCandidateIn
 		return domain.MemoryCandidate{}, fmt.Errorf("validate source evidence: %w", err)
 	}
 
+	candidate, err := s.newPendingCandidate(input, sourceEventIDs, s.now().UTC())
+	if err != nil {
+		return domain.MemoryCandidate{}, err
+	}
+	if err := s.store.CreateCandidate(ctx, candidate); err != nil {
+		return domain.MemoryCandidate{}, err
+	}
+	return candidate, nil
+}
+
+func validateCandidateInput(input ProposeCandidateInput) ([]string, error) {
+	if err := validateScope(input.TenantID, input.UserID); err != nil {
+		return nil, err
+	}
+	if input.Kind != domain.MemoryKindEpisodic && input.Kind != domain.MemoryKindSemantic && input.Kind != domain.MemoryKindProcedural {
+		return nil, invalid("kind must be episodic, semantic, or procedural")
+	}
+	if err := validateRequiredLabel("category", input.Category, 128); err != nil {
+		return nil, err
+	}
+	if err := validateRequiredLabel("key", input.Key, 128); err != nil {
+		return nil, err
+	}
+	if err := validateRequiredText("value", input.Value, maxValueBytes); err != nil {
+		return nil, err
+	}
+	if err := validateOptionalLabel("person", input.Person, 256); err != nil {
+		return nil, err
+	}
+	if err := validateOptionalLabel("relationship", input.Relationship, 256); err != nil {
+		return nil, err
+	}
+	if err := validateOptionalText("backstory", input.Backstory, 2<<10); err != nil {
+		return nil, err
+	}
+	if err := validateRequiredText("extractor", input.Extractor, 128); err != nil {
+		return nil, err
+	}
+	if err := validateRequiredText("extractor_version", input.ExtractorVersion, 128); err != nil {
+		return nil, err
+	}
+	if err := validateMetadata(input.Metadata); err != nil {
+		return nil, err
+	}
+	if input.ExpiresAt != nil && input.ExpiresAt.IsZero() {
+		return nil, invalid("expires_at must be a non-zero timestamp")
+	}
+
+	sourceEventIDs, err := uniqueIdentifiers("source_event_ids", input.SourceEventIDs, maxSourceEvents)
+	if err != nil {
+		return nil, err
+	}
+	return sourceEventIDs, nil
+}
+
+func (s *Service) newPendingCandidate(input ProposeCandidateInput, sourceEventIDs []string, createdAt time.Time) (domain.MemoryCandidate, error) {
 	candidateID, err := s.newID("cand")
 	if err != nil {
 		return domain.MemoryCandidate{}, err
@@ -218,12 +253,9 @@ func (s *Service) ProposeCandidate(ctx context.Context, input ProposeCandidateIn
 		Extractor:        strings.TrimSpace(input.Extractor),
 		ExtractorVersion: strings.TrimSpace(input.ExtractorVersion),
 		Status:           domain.CandidatePending,
-		CreatedAt:        s.now().UTC(),
+		CreatedAt:        createdAt.UTC(),
 		ExpiresAt:        cloneTime(input.ExpiresAt),
 		Metadata:         cloneMap(input.Metadata),
-	}
-	if err := s.store.CreateCandidate(ctx, candidate); err != nil {
-		return domain.MemoryCandidate{}, err
 	}
 	return candidate, nil
 }

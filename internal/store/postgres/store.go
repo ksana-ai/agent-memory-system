@@ -180,40 +180,120 @@ func (s *Store) CreateCandidate(ctx context.Context, candidate domain.MemoryCand
 		if err != nil {
 			return fmt.Errorf("encode candidate metadata: %w", err)
 		}
-		commandTag, err := tx.Exec(ctx, `
-			INSERT INTO agent_memory.memory_candidates (
-				tenant_id, user_id, id, kind, category, memory_key, value,
-				person, relationship, backstory, extractor, extractor_version,
-				status, metadata, created_at, expires_at
-			) VALUES (
-				$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-				$13, $14, $15, $16
-			)
-			ON CONFLICT (tenant_id, user_id, id) DO NOTHING`,
-			candidate.TenantID, candidate.UserID, candidate.ID, string(candidate.Kind),
-			candidate.Category, candidate.Key, candidate.Value, candidate.Person,
-			candidate.Relationship, candidate.Backstory, candidate.Extractor,
-			candidate.ExtractorVersion, string(candidate.Status), metadata, candidate.CreatedAt,
-			candidate.ExpiresAt,
-		)
-		if err != nil {
-			return mapPostgresError("create candidate", err)
+		return insertCandidate(ctx, tx, candidate, metadata)
+	})
+}
+
+func (s *Store) CreateCandidateBatch(ctx context.Context, command domainstore.CandidateBatchCommand) error {
+	if strings.TrimSpace(command.TenantID) == "" || strings.TrimSpace(command.UserID) == "" {
+		return fmt.Errorf("candidate batch scope is required: %w", domain.ErrInvalid)
+	}
+
+	return s.withScopeWrite(ctx, command.TenantID, command.UserID, func(tx pgx.Tx) error {
+		if err := requireContextRevision(ctx, tx, command.TenantID, command.UserID, command.ExpectedRevision); err != nil {
+			return err
 		}
-		if commandTag.RowsAffected() != 1 {
-			return fmt.Errorf("candidate %q: %w", candidate.ID, domain.ErrConflict)
+
+		candidateIDs := make([]string, 0, len(command.Candidates))
+		encodedMetadata := make([][]byte, len(command.Candidates))
+		seenCandidateIDs := make(map[string]struct{}, len(command.Candidates))
+		for index, candidate := range command.Candidates {
+			if candidate.TenantID != command.TenantID || candidate.UserID != command.UserID {
+				return fmt.Errorf("candidate batch item %d scope does not match command scope: %w", index, domain.ErrInvalid)
+			}
+			if strings.TrimSpace(candidate.ID) == "" {
+				return fmt.Errorf("candidate batch item %d id is required: %w", index, domain.ErrInvalid)
+			}
+			if _, duplicate := seenCandidateIDs[candidate.ID]; duplicate {
+				return fmt.Errorf("candidate batch repeats candidate %q: %w", candidate.ID, domain.ErrInvalid)
+			}
+			seenCandidateIDs[candidate.ID] = struct{}{}
+			candidateIDs = append(candidateIDs, candidate.ID)
+
+			if candidate.Status != domain.CandidatePending || candidate.Review != nil {
+				return fmt.Errorf("candidate %q must be pending and unreviewed: %w", candidate.ID, domain.ErrInvalid)
+			}
+			if len(candidate.SourceEventIDs) == 0 {
+				return fmt.Errorf("candidate %q has no source evidence: %w", candidate.ID, domain.ErrInvalid)
+			}
+			for _, eventID := range candidate.SourceEventIDs {
+				if strings.TrimSpace(eventID) == "" {
+					return fmt.Errorf("candidate %q has an empty source evidence id: %w", candidate.ID, domain.ErrInvalid)
+				}
+			}
+			if duplicate := firstDuplicate(candidate.SourceEventIDs); duplicate != "" {
+				return fmt.Errorf("candidate %q repeats source evidence %q: %w", candidate.ID, duplicate, domain.ErrInvalid)
+			}
+			if err := validateEvidenceSources(ctx, tx, command.TenantID, command.UserID, candidate.SourceEventIDs); err != nil {
+				return fmt.Errorf("candidate %q: %w", candidate.ID, err)
+			}
+			metadata, err := marshalMetadata(candidate.Metadata)
+			if err != nil {
+				return fmt.Errorf("encode candidate %q metadata: %w", candidate.ID, err)
+			}
+			encodedMetadata[index] = metadata
 		}
-		for sourceOrder, eventID := range candidate.SourceEventIDs {
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO agent_memory.candidate_source_events (
-					tenant_id, user_id, candidate_id, evidence_event_id, source_order
-				) VALUES ($1, $2, $3, $4, $5)`,
-				candidate.TenantID, candidate.UserID, candidate.ID, eventID, sourceOrder,
-			); err != nil {
-				return mapPostgresError("attach candidate source evidence", err)
+
+		if len(candidateIDs) > 0 {
+			var existingID string
+			err := tx.QueryRow(ctx, `
+				SELECT id
+				FROM agent_memory.memory_candidates
+				WHERE tenant_id = $1 AND user_id = $2 AND id = ANY($3::text[])
+				ORDER BY id
+				LIMIT 1`, command.TenantID, command.UserID, candidateIDs).Scan(&existingID)
+			switch {
+			case err == nil:
+				return fmt.Errorf("candidate %q: %w", existingID, domain.ErrConflict)
+			case errors.Is(err, pgx.ErrNoRows):
+			case err != nil:
+				return mapPostgresError("validate candidate batch ids", err)
+			}
+		}
+
+		for index, candidate := range command.Candidates {
+			if err := insertCandidate(ctx, tx, candidate, encodedMetadata[index]); err != nil {
+				return err
 			}
 		}
 		return nil
 	})
+}
+
+func insertCandidate(ctx context.Context, tx pgx.Tx, candidate domain.MemoryCandidate, metadata []byte) error {
+	commandTag, err := tx.Exec(ctx, `
+		INSERT INTO agent_memory.memory_candidates (
+			tenant_id, user_id, id, kind, category, memory_key, value,
+			person, relationship, backstory, extractor, extractor_version,
+			status, metadata, created_at, expires_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+			$13, $14, $15, $16
+		)
+		ON CONFLICT (tenant_id, user_id, id) DO NOTHING`,
+		candidate.TenantID, candidate.UserID, candidate.ID, string(candidate.Kind),
+		candidate.Category, candidate.Key, candidate.Value, candidate.Person,
+		candidate.Relationship, candidate.Backstory, candidate.Extractor,
+		candidate.ExtractorVersion, string(candidate.Status), metadata, candidate.CreatedAt,
+		candidate.ExpiresAt,
+	)
+	if err != nil {
+		return mapPostgresError("create candidate", err)
+	}
+	if commandTag.RowsAffected() != 1 {
+		return fmt.Errorf("candidate %q: %w", candidate.ID, domain.ErrConflict)
+	}
+	for sourceOrder, eventID := range candidate.SourceEventIDs {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO agent_memory.candidate_source_events (
+				tenant_id, user_id, candidate_id, evidence_event_id, source_order
+			) VALUES ($1, $2, $3, $4, $5)`,
+			candidate.TenantID, candidate.UserID, candidate.ID, eventID, sourceOrder,
+		); err != nil {
+			return mapPostgresError("attach candidate source evidence", err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) CandidateByID(ctx context.Context, tenantID, userID, candidateID string) (domain.MemoryCandidate, error) {
@@ -650,6 +730,28 @@ func lockScope(ctx context.Context, tx pgx.Tx, tenantID, userID string) error {
 	}
 	if revision < 0 {
 		return fmt.Errorf("negative context revision: %w", domain.ErrInvariant)
+	}
+	return nil
+}
+
+func requireContextRevision(ctx context.Context, tx pgx.Tx, tenantID, userID string, expected uint64) error {
+	var current int64
+	if err := tx.QueryRow(ctx, `
+		SELECT context_revision
+		FROM agent_memory.user_scope_state
+		WHERE tenant_id = $1 AND user_id = $2`, tenantID, userID).Scan(&current); err != nil {
+		return mapExpectedRowError("compare candidate batch context revision", err)
+	}
+	if current < 0 {
+		return fmt.Errorf("negative context revision: %w", domain.ErrInvariant)
+	}
+	if uint64(current) != expected {
+		return fmt.Errorf(
+			"candidate batch expected context revision %d, current revision is %d: %w",
+			expected,
+			current,
+			domain.ErrConflict,
+		)
 	}
 	return nil
 }

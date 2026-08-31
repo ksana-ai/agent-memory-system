@@ -35,6 +35,155 @@ func TestEvidenceIDsAreScopedByTenantAndUser(t *testing.T) {
 	}
 }
 
+func TestCreateCandidateBatchCreatesAllPendingCandidatesWithoutChangingRevision(t *testing.T) {
+	storage := memstore.New()
+	ctx := context.Background()
+	for _, eventID := range []string{"event-batch-one", "event-batch-two"} {
+		if err := storage.AppendEvidence(ctx, domain.EvidenceEvent{
+			ID: eventID, TenantID: "tenant", UserID: "user", SessionID: "session",
+			Actor: domain.ActorUser, Content: eventID,
+		}); err != nil {
+			t.Fatalf("append evidence %q: %v", eventID, err)
+		}
+	}
+	candidates := []domain.MemoryCandidate{
+		batchCandidate("candidate-batch-one", "event-batch-one"),
+		batchCandidate("candidate-batch-two", "event-batch-two"),
+	}
+	if err := storage.CreateCandidateBatch(ctx, store.CandidateBatchCommand{
+		TenantID: "tenant", UserID: "user", ExpectedRevision: 0, Candidates: candidates,
+	}); err != nil {
+		t.Fatalf("create candidate batch: %v", err)
+	}
+
+	// The store owns its copy of the batch values.
+	candidates[0].SourceEventIDs[0] = "mutated"
+	for _, candidateID := range []string{"candidate-batch-one", "candidate-batch-two"} {
+		candidate, err := storage.CandidateByID(ctx, "tenant", "user", candidateID)
+		if err != nil {
+			t.Fatalf("load candidate %q: %v", candidateID, err)
+		}
+		if candidate.Status != domain.CandidatePending || candidate.Review != nil || candidate.SourceEventIDs[0] == "mutated" {
+			t.Fatalf("stored candidate %q=%#v", candidateID, candidate)
+		}
+	}
+	if revision, err := storage.ContextRevision(ctx, "tenant", "user"); err != nil || revision != 0 {
+		t.Fatalf("revision after pending batch=%d error=%v, want 0", revision, err)
+	}
+	if err := storage.CreateCandidateBatch(ctx, store.CandidateBatchCommand{
+		TenantID: "tenant", UserID: "user", ExpectedRevision: 0,
+	}); err != nil {
+		t.Fatalf("create current empty batch: %v", err)
+	}
+}
+
+func TestCreateCandidateBatchValidationIsAtomic(t *testing.T) {
+	storage := memstore.New()
+	ctx := context.Background()
+	if err := storage.AppendEvidence(ctx, domain.EvidenceEvent{
+		ID: "event-real", TenantID: "tenant", UserID: "user", SessionID: "session",
+		Actor: domain.ActorUser, Content: "real",
+	}); err != nil {
+		t.Fatalf("append evidence: %v", err)
+	}
+	first := batchCandidate("candidate-valid", "event-real")
+	second := batchCandidate("candidate-missing", "event-missing")
+	err := storage.CreateCandidateBatch(ctx, store.CandidateBatchCommand{
+		TenantID: "tenant", UserID: "user", ExpectedRevision: 0,
+		Candidates: []domain.MemoryCandidate{first, second},
+	})
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("create invalid batch error=%v, want not found", err)
+	}
+	for _, candidateID := range []string{first.ID, second.ID} {
+		if _, err := storage.CandidateByID(ctx, "tenant", "user", candidateID); !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("candidate %q after failed batch error=%v, want not found", candidateID, err)
+		}
+	}
+}
+
+func TestCreateCandidateBatchRevisionFencePreventsEvidenceIDABA(t *testing.T) {
+	storage := memstore.New()
+	ctx := context.Background()
+	original := domain.EvidenceEvent{
+		ID: "event-aba", TenantID: "tenant", UserID: "user", SessionID: "old-session",
+		Actor: domain.ActorUser, Content: "old evidence",
+	}
+	if err := storage.AppendEvidence(ctx, original); err != nil {
+		t.Fatalf("append original evidence: %v", err)
+	}
+	if _, err := storage.ForgetUser(ctx, "tenant", "user", time.Now().UTC()); err != nil {
+		t.Fatalf("forget user: %v", err)
+	}
+	replacement := original
+	replacement.SessionID = "new-session"
+	replacement.Content = "new evidence with reused id"
+	if err := storage.AppendEvidence(ctx, replacement); err != nil {
+		t.Fatalf("append replacement evidence: %v", err)
+	}
+
+	value := batchCandidate("candidate-stale", original.ID)
+	err := storage.CreateCandidateBatch(ctx, store.CandidateBatchCommand{
+		TenantID: "tenant", UserID: "user", ExpectedRevision: 0,
+		Candidates: []domain.MemoryCandidate{value},
+	})
+	if !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("create stale batch error=%v, want conflict", err)
+	}
+	if _, err := storage.CandidateByID(ctx, "tenant", "user", value.ID); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("stale candidate after revision conflict error=%v, want not found", err)
+	}
+	if err := storage.CreateCandidateBatch(ctx, store.CandidateBatchCommand{
+		TenantID: "tenant", UserID: "user", ExpectedRevision: 0,
+	}); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("empty stale batch error=%v, want conflict", err)
+	}
+}
+
+func TestCreateCandidateBatchRejectsInvalidCandidateSets(t *testing.T) {
+	newFixture := func(t *testing.T) *memstore.Store {
+		t.Helper()
+		storage := memstore.New()
+		if err := storage.AppendEvidence(context.Background(), domain.EvidenceEvent{
+			ID: "event", TenantID: "tenant", UserID: "user", SessionID: "session",
+			Actor: domain.ActorUser, Content: "source",
+		}); err != nil {
+			t.Fatalf("append evidence: %v", err)
+		}
+		return storage
+	}
+	base := batchCandidate("candidate", "event")
+	reviewed := base
+	reviewed.Status = domain.CandidateApproved
+	duplicateSource := base
+	duplicateSource.SourceEventIDs = []string{"event", "event"}
+	wrongScope := base
+	wrongScope.UserID = "other-user"
+
+	for _, fixture := range []struct {
+		name       string
+		candidates []domain.MemoryCandidate
+	}{
+		{name: "cross scope", candidates: []domain.MemoryCandidate{wrongScope}},
+		{name: "not pending", candidates: []domain.MemoryCandidate{reviewed}},
+		{name: "duplicate source", candidates: []domain.MemoryCandidate{duplicateSource}},
+		{name: "duplicate candidate id", candidates: []domain.MemoryCandidate{base, base}},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			storage := newFixture(t)
+			err := storage.CreateCandidateBatch(context.Background(), store.CandidateBatchCommand{
+				TenantID: "tenant", UserID: "user", ExpectedRevision: 0, Candidates: fixture.candidates,
+			})
+			if !errors.Is(err, domain.ErrInvalid) {
+				t.Fatalf("create invalid batch error=%v, want invalid", err)
+			}
+			if _, err := storage.CandidateByID(context.Background(), "tenant", "user", base.ID); !errors.Is(err, domain.ErrNotFound) {
+				t.Fatalf("candidate after invalid batch error=%v, want not found", err)
+			}
+		})
+	}
+}
+
 func TestConcurrentReviewHasOneWinner(t *testing.T) {
 	storage := memstore.New()
 	candidate := seedCandidate(t, storage, "candidate-1", "preference", "window")
@@ -202,6 +351,15 @@ func TestCardCommitTimeIsMonotonicWhenReviewTimesArriveOutOfOrder(t *testing.T) 
 
 func seedCandidate(t *testing.T, storage *memstore.Store, candidateID, key, value string) domain.MemoryCandidate {
 	return seedCandidateWithExpiration(t, storage, candidateID, key, value, nil)
+}
+
+func batchCandidate(candidateID, eventID string) domain.MemoryCandidate {
+	return domain.MemoryCandidate{
+		ID: candidateID, TenantID: "tenant", UserID: "user", Kind: domain.MemoryKindSemantic,
+		Category: "preference", Key: candidateID, Value: "value", Person: "self", Relationship: "self",
+		SourceEventIDs: []string{eventID}, Extractor: "batch-test", ExtractorVersion: "v1",
+		Status: domain.CandidatePending, CreatedAt: time.Date(2026, 8, 29, 0, 0, 0, 0, time.UTC),
+	}
 }
 
 func seedCandidateWithExpiration(t *testing.T, storage *memstore.Store, candidateID, key, value string, expiresAt *time.Time) domain.MemoryCandidate {

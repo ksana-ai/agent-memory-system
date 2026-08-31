@@ -53,6 +53,27 @@ func TestPostgresFTSNamespaceRestoresLogicalScopeAndCleansPhysicalScope(t *testi
 	if err := namespace.CreateCandidate(ctx, candidate); err != nil {
 		t.Fatalf("create candidate: %v", err)
 	}
+	batchCandidate := candidate
+	batchCandidate.ID = "candidate-batch-stable"
+	batchCandidate.Key = "batch-region"
+	batchCandidate.Value = "Project Aurora also has a batch candidate"
+	if err := namespace.CreateCandidateBatch(ctx, store.CandidateBatchCommand{
+		TenantID: logicalTenantID, UserID: logicalUserID, ExpectedRevision: 0,
+		Candidates: []domain.MemoryCandidate{batchCandidate},
+	}); err != nil {
+		t.Fatalf("create candidate batch: %v", err)
+	}
+	if batchCandidate.TenantID != logicalTenantID || batchCandidate.UserID != logicalUserID {
+		t.Fatalf("batch input was mutated: %#v", batchCandidate)
+	}
+	rawBatchCandidate, err := backend.Store.CandidateByID(ctx, physical.tenantID, physical.userID, batchCandidate.ID)
+	if err != nil || rawBatchCandidate.TenantID != physical.tenantID || rawBatchCandidate.UserID != physical.userID {
+		t.Fatalf("raw physical batch candidate = %#v, error=%v", rawBatchCandidate, err)
+	}
+	logicalBatchCandidate, err := namespace.CandidateByID(ctx, logicalTenantID, logicalUserID, batchCandidate.ID)
+	if err != nil || logicalBatchCandidate.TenantID != logicalTenantID || logicalBatchCandidate.UserID != logicalUserID {
+		t.Fatalf("restored logical batch candidate = %#v, error=%v", logicalBatchCandidate, err)
+	}
 	reviewed, memory, err := namespace.ReviewCandidate(ctx, store.CandidateReviewCommand{
 		TenantID: logicalTenantID, UserID: logicalUserID, CandidateID: candidate.ID, MemoryID: "memory-stable",
 		Review: domain.CandidateReview{Decision: domain.DecisionApprove, ReviewerID: "reviewer", Reason: "supported", ReviewedAt: event.RecordedAt.Add(time.Minute)},

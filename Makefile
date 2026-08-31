@@ -29,7 +29,7 @@ EVAL_VECTOR_V2_MANIFEST := $(CURDIR)/artifacts/eval/memory-lifecycle-v2-postgres
 EVAL_SEMANTIC_V1_MANIFEST := $(CURDIR)/artifacts/eval/memory-semantic-extension-v1-postgres-vector-latest.json
 GO_FILES := $(shell find . -path './.cache' -prune -o -path './.git' -prune -o -name '*.go' -type f -print)
 
-.PHONY: build build-eval build-projection-promoter build-projection-reconciler build-projection-worker build-server db-down db-up eval eval-postgres eval-postgres-recorded eval-recorded eval-semantic eval-semantic-recorded eval-v2 eval-vector eval-vector-recorded fmt fmt-check migrate projection-backfill projection-promote projection-reconcile projection-target-register projection-worker projection-worker-probe semantic-frozen server server-dense server-hybrid test test-integration test-outbox-integration test-promotion-integration test-race test-reconciliation-integration test-serving-retrieval test-serving-retrieval-integration test-vector-integration test-worker-integration test-worker-vector-integration verify verify-postgres verify-promotion verify-reconciliation verify-semantic verify-serving-retrieval verify-vector verify-worker vet
+.PHONY: build build-eval build-projection-promoter build-projection-reconciler build-projection-worker build-server db-down db-up eval eval-postgres eval-postgres-recorded eval-recorded eval-semantic eval-semantic-recorded eval-v2 eval-vector eval-vector-recorded fmt fmt-check migrate projection-backfill projection-promote projection-reconcile projection-target-register projection-worker projection-worker-probe semantic-frozen server server-dense server-hybrid test test-extraction test-extraction-integration test-integration test-outbox-integration test-promotion-integration test-race test-reconciliation-integration test-serving-retrieval test-serving-retrieval-integration test-vector-integration test-worker-integration test-worker-vector-integration verify verify-extraction verify-postgres verify-promotion verify-reconciliation verify-semantic verify-serving-retrieval verify-vector verify-worker vet
 
 build:
 	$(GO) build ./...
@@ -135,6 +135,15 @@ test-serving-retrieval-integration: db-up build-server
 		-run 'Test(SearchServingVector|ServerServingDense|ServerDenseFails)' \
 		./internal/store/postgres ./cmd/server
 
+test-extraction:
+	$(GO) test -race ./internal/extraction ./internal/app ./internal/api ./internal/store/memstore ./cmd/server
+
+test-extraction-integration: db-up build-server
+	@TEST_SERVER_BINARY='$(SERVER_BINARY)' \
+		$(GO) test -p 1 -race -tags=integration -count=1 \
+		-run '^(TestPostgresStoreCreateCandidateBatchIsAtomicAndRevisionFenced|TestServerProcessAutomaticExtractionRequiresExplicitReview)$$' \
+		./internal/store/postgres ./cmd/server
+
 test-race:
 	$(GO) test -race ./...
 
@@ -176,6 +185,8 @@ projection-promote: db-up
 	@$(GO) run ./cmd/projection-promoter
 
 verify-postgres: test-integration eval-postgres
+
+verify-extraction: fmt-check vet test-extraction test-extraction-integration
 
 verify-vector: test-vector-integration eval-vector
 

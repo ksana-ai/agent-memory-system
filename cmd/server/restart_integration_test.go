@@ -108,6 +108,10 @@ type runningServer struct {
 }
 
 func startServer(t *testing.T, binary, databaseURL string) *runningServer {
+	return startServerWithEnvironment(t, binary, databaseURL, nil)
+}
+
+func startServerWithEnvironment(t *testing.T, binary, databaseURL string, environment map[string]string) *runningServer {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -121,6 +125,9 @@ func startServer(t *testing.T, binary, databaseURL string) *runningServer {
 	logs := &synchronizedBuffer{}
 	command := exec.Command(binary, "-addr", address)
 	command.Env = withEnvironmentVariable(os.Environ(), "DATABASE_URL", databaseURL)
+	for key, value := range environment {
+		command.Env = withEnvironmentVariable(command.Env, key, value)
+	}
 	command.Stdout = logs
 	command.Stderr = logs
 	if err := command.Start(); err != nil {

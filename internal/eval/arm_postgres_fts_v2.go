@@ -206,6 +206,20 @@ func (namespace *postgresFTSNamespace) CreateCandidate(ctx context.Context, cand
 	return namespace.backend.CreateCandidate(ctx, candidate)
 }
 
+func (namespace *postgresFTSNamespace) CreateCandidateBatch(ctx context.Context, command store.CandidateBatchCommand) error {
+	logicalTenantID, logicalUserID := command.TenantID, command.UserID
+	physical := namespace.physicalScope(logicalTenantID, logicalUserID)
+	command.TenantID, command.UserID = physical.tenantID, physical.userID
+	command.Candidates = append([]domain.MemoryCandidate(nil), command.Candidates...)
+	for index := range command.Candidates {
+		candidate := &command.Candidates[index]
+		if candidate.TenantID == logicalTenantID && candidate.UserID == logicalUserID {
+			candidate.TenantID, candidate.UserID = physical.tenantID, physical.userID
+		}
+	}
+	return namespace.backend.CreateCandidateBatch(ctx, command)
+}
+
 func (namespace *postgresFTSNamespace) CandidateByID(ctx context.Context, tenantID, userID, candidateID string) (domain.MemoryCandidate, error) {
 	physical := namespace.physicalScope(tenantID, userID)
 	candidate, err := namespace.backend.CandidateByID(ctx, physical.tenantID, physical.userID, candidateID)

@@ -17,6 +17,7 @@ import (
 	"github.com/kai443/go-agent-memory-system/internal/api"
 	"github.com/kai443/go-agent-memory-system/internal/app"
 	"github.com/kai443/go-agent-memory-system/internal/embedding"
+	"github.com/kai443/go-agent-memory-system/internal/extraction"
 	"github.com/kai443/go-agent-memory-system/internal/migrations"
 	"github.com/kai443/go-agent-memory-system/internal/retrieval"
 	"github.com/kai443/go-agent-memory-system/internal/store/postgres"
@@ -31,8 +32,15 @@ const (
 	retrievalModeDense  = "dense"
 	retrievalModeHybrid = "hybrid"
 
-	serverStartupTimeout   = 30 * time.Second
-	serverEmbeddingTimeout = 10 * time.Second
+	serverStartupTimeout     = 30 * time.Second
+	serverEmbeddingTimeout   = 10 * time.Second
+	serverDefaultTimeout     = 15 * time.Second
+	serverExtractionGrace    = 5 * time.Second
+	defaultExtractionTimeout = 10 * time.Second
+	maxExtractionTimeout     = 120 * time.Second
+
+	extractionAuthNone   = "none"
+	extractionAuthBearer = "bearer"
 )
 
 type serverConfig struct {
@@ -43,6 +51,15 @@ type serverConfig struct {
 	embeddingModel string
 	expectedSpace  string
 	retrievalPhase string
+
+	extractionEnabled  bool
+	extractionEndpoint string
+	extractionModel    string
+	extractionAuthMode string
+	extractionToken    string
+	extractionTimeout  time.Duration
+	extractorName      string
+	extractorVersion   string
 }
 
 type denseReadiness interface {
@@ -79,6 +96,21 @@ func run(args []string, getenv func(string) string) error {
 	config, err := loadServerConfig(args, getenv)
 	if err != nil {
 		return err
+	}
+	var candidateExtractor extraction.Extractor
+	if config.extractionEnabled {
+		client, createErr := extraction.NewClient(extraction.Config{
+			Endpoint:         config.extractionEndpoint,
+			Model:            config.extractionModel,
+			BearerToken:      config.extractionToken,
+			Timeout:          config.extractionTimeout,
+			ExtractorName:    config.extractorName,
+			ExtractorVersion: config.extractorVersion,
+		})
+		if createErr != nil {
+			return fmt.Errorf("create candidate extractor: %w", createErr)
+		}
+		candidateExtractor = client
 	}
 
 	startupContext, cancelStartup := context.WithTimeout(context.Background(), serverStartupTimeout)
@@ -120,7 +152,11 @@ func run(args []string, getenv func(string) string) error {
 		readiness = combinedReadiness{storage: storage, dense: dense}
 	}
 
-	service, err := app.New(storage, selectedRetriever)
+	serviceOptions := make([]app.Option, 0, 1)
+	if candidateExtractor != nil {
+		serviceOptions = append(serviceOptions, app.WithCandidateExtractor(candidateExtractor))
+	}
+	service, err := app.New(storage, selectedRetriever, serviceOptions...)
 	if err != nil {
 		return fmt.Errorf("create service: %w", err)
 	}
@@ -134,12 +170,16 @@ func run(args []string, getenv func(string) string) error {
 		return fmt.Errorf("create HTTP handler: %w", err)
 	}
 
+	writeTimeout := serverDefaultTimeout
+	if config.extractionEnabled && config.extractionTimeout+serverExtractionGrace > writeTimeout {
+		writeTimeout = config.extractionTimeout + serverExtractionGrace
+	}
 	server := &http.Server{
 		Addr:              config.address,
 		Handler:           handler.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
+		ReadTimeout:       serverDefaultTimeout,
+		WriteTimeout:      writeTimeout,
 		IdleTimeout:       60 * time.Second,
 	}
 	shutdownContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -198,7 +238,6 @@ func loadServerConfig(args []string, getenv func(string) string) (serverConfig, 
 	switch config.retrievalMode {
 	case retrievalModeFTS:
 		config.retrievalPhase = serverPhaseFTS
-		return config, nil
 	case retrievalModeDense:
 		config.retrievalPhase = serverPhaseDense
 	case retrievalModeHybrid:
@@ -207,17 +246,78 @@ func loadServerConfig(args []string, getenv func(string) string) (serverConfig, 
 		return serverConfig{}, errors.New("SERVER_RETRIEVAL_MODE must be fts, dense, or hybrid")
 	}
 
-	config.embeddingsURL = strings.TrimSpace(getenv("LMSTUDIO_EMBEDDINGS_URL"))
-	config.embeddingModel = strings.TrimSpace(getenv("LMSTUDIO_EMBEDDING_MODEL"))
-	config.expectedSpace = strings.TrimSpace(getenv("SERVER_EXPECTED_SERVING_SPACE"))
-	if config.embeddingsURL == "" {
-		return serverConfig{}, errors.New("LMSTUDIO_EMBEDDINGS_URL is required for dense or hybrid retrieval")
+	if config.retrievalMode != retrievalModeFTS {
+		config.embeddingsURL = strings.TrimSpace(getenv("LMSTUDIO_EMBEDDINGS_URL"))
+		config.embeddingModel = strings.TrimSpace(getenv("LMSTUDIO_EMBEDDING_MODEL"))
+		config.expectedSpace = strings.TrimSpace(getenv("SERVER_EXPECTED_SERVING_SPACE"))
+		if config.embeddingsURL == "" {
+			return serverConfig{}, errors.New("LMSTUDIO_EMBEDDINGS_URL is required for dense or hybrid retrieval")
+		}
+		if config.embeddingModel == "" {
+			return serverConfig{}, errors.New("LMSTUDIO_EMBEDDING_MODEL is required for dense or hybrid retrieval")
+		}
+		if config.expectedSpace == "" {
+			return serverConfig{}, errors.New("SERVER_EXPECTED_SERVING_SPACE is required for dense or hybrid retrieval")
+		}
 	}
-	if config.embeddingModel == "" {
-		return serverConfig{}, errors.New("LMSTUDIO_EMBEDDING_MODEL is required for dense or hybrid retrieval")
+
+	enabledValue := strings.TrimSpace(getenv("MEMORY_EXTRACTION_ENABLED"))
+	if enabledValue == "" {
+		enabledValue = "false"
 	}
-	if config.expectedSpace == "" {
-		return serverConfig{}, errors.New("SERVER_EXPECTED_SERVING_SPACE is required for dense or hybrid retrieval")
+	var enabled bool
+	switch enabledValue {
+	case "true":
+		enabled = true
+	case "false":
+		enabled = false
+	default:
+		return serverConfig{}, errors.New("MEMORY_EXTRACTION_ENABLED must be true or false")
+	}
+	config.extractionEnabled = enabled
+	if !enabled {
+		return config, nil
+	}
+
+	config.extractionEndpoint = strings.TrimSpace(getenv("MEMORY_EXTRACTION_ENDPOINT"))
+	config.extractionModel = strings.TrimSpace(getenv("MEMORY_EXTRACTION_MODEL"))
+	config.extractionAuthMode = strings.TrimSpace(getenv("MEMORY_EXTRACTION_AUTH_MODE"))
+	if config.extractionAuthMode == "" {
+		config.extractionAuthMode = extractionAuthNone
+	}
+	config.extractorName = strings.TrimSpace(getenv("MEMORY_EXTRACTION_EXTRACTOR_NAME"))
+	config.extractorVersion = strings.TrimSpace(getenv("MEMORY_EXTRACTION_EXTRACTOR_VERSION"))
+	timeoutValue := strings.TrimSpace(getenv("MEMORY_EXTRACTION_TIMEOUT"))
+	if timeoutValue == "" {
+		config.extractionTimeout = defaultExtractionTimeout
+	} else {
+		parsedTimeout, parseErr := time.ParseDuration(timeoutValue)
+		if parseErr != nil || parsedTimeout <= 0 || parsedTimeout > maxExtractionTimeout {
+			return serverConfig{}, errors.New("MEMORY_EXTRACTION_TIMEOUT must be a positive duration no greater than 120s")
+		}
+		config.extractionTimeout = parsedTimeout
+	}
+	if config.extractionEndpoint == "" {
+		return serverConfig{}, errors.New("MEMORY_EXTRACTION_ENDPOINT is required when extraction is enabled")
+	}
+	if config.extractionModel == "" {
+		return serverConfig{}, errors.New("MEMORY_EXTRACTION_MODEL is required when extraction is enabled")
+	}
+	if config.extractorName == "" {
+		return serverConfig{}, errors.New("MEMORY_EXTRACTION_EXTRACTOR_NAME is required when extraction is enabled")
+	}
+	if config.extractorVersion == "" {
+		return serverConfig{}, errors.New("MEMORY_EXTRACTION_EXTRACTOR_VERSION is required when extraction is enabled")
+	}
+	switch config.extractionAuthMode {
+	case extractionAuthNone:
+	case extractionAuthBearer:
+		config.extractionToken = strings.TrimSpace(getenv("MEMORY_EXTRACTION_BEARER_TOKEN"))
+		if config.extractionToken == "" {
+			return serverConfig{}, errors.New("MEMORY_EXTRACTION_BEARER_TOKEN is required for bearer authentication")
+		}
+	default:
+		return serverConfig{}, errors.New("MEMORY_EXTRACTION_AUTH_MODE must be none or bearer")
 	}
 	return config, nil
 }

@@ -89,11 +89,58 @@ func (handler *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", handler.health)
 	mux.HandleFunc("GET /readyz", handler.ready)
 	mux.HandleFunc("POST /v1/evidence", handler.ingestEvidence)
+	mux.HandleFunc("POST /v1/memory-candidate-extractions", handler.extractCandidates)
 	mux.HandleFunc("POST /v1/memory-candidates", handler.proposeCandidate)
 	mux.HandleFunc("POST /v1/memory-candidates/{candidate_id}/reviews", handler.reviewCandidate)
 	mux.HandleFunc("POST /v1/context-packs", handler.buildContext)
 	mux.HandleFunc("DELETE /v1/users/{user_id}", handler.forgetUser)
 	return mux
+}
+
+type extractCandidatesRequest struct {
+	SourceEventIDs []string `json:"source_event_ids"`
+}
+
+type extractorResponse struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+type extractCandidatesResponse struct {
+	ExtractionID   string                   `json:"extraction_id"`
+	SourceEventIDs []string                 `json:"source_event_ids"`
+	Extractor      extractorResponse        `json:"extractor"`
+	Candidates     []domain.MemoryCandidate `json:"candidates"`
+}
+
+func (handler *Handler) extractCandidates(writer http.ResponseWriter, request *http.Request) {
+	tenantID, userID, ok := readScope(writer, request)
+	if !ok {
+		return
+	}
+	var payload extractCandidatesRequest
+	if err := decodeJSON(writer, request, &payload); err != nil {
+		writeError(writer, err)
+		return
+	}
+	result, err := handler.service.ExtractCandidates(request.Context(), app.ExtractCandidatesInput{
+		TenantID:       tenantID,
+		UserID:         userID,
+		SourceEventIDs: payload.SourceEventIDs,
+	})
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, extractCandidatesResponse{
+		ExtractionID:   result.ExtractionID,
+		SourceEventIDs: result.SourceEventIDs,
+		Extractor: extractorResponse{
+			Name:    result.ExtractorName,
+			Version: result.ExtractorVersion,
+		},
+		Candidates: result.Candidates,
+	})
 }
 
 func (handler *Handler) health(writer http.ResponseWriter, _ *http.Request) {
@@ -337,6 +384,14 @@ func writeError(writer http.ResponseWriter, err error) {
 		status, code, message = http.StatusNotFound, "not_found", "resource not found"
 	case errors.Is(err, domain.ErrConflict):
 		status, code, message = http.StatusConflict, "conflict", err.Error()
+	case errors.Is(err, domain.ErrExtractionDisabled):
+		status, code, message = http.StatusServiceUnavailable, "extraction_disabled", "candidate extraction is disabled"
+	case errors.Is(err, domain.ErrExtractionUnavailable):
+		status, code, message = http.StatusServiceUnavailable, "extraction_unavailable", "candidate extraction is temporarily unavailable"
+	case errors.Is(err, domain.ErrExtractionRejected):
+		status, code, message = http.StatusBadGateway, "extraction_rejected", "candidate extractor rejected the request"
+	case errors.Is(err, domain.ErrExtractionInvalidResponse):
+		status, code, message = http.StatusBadGateway, "invalid_extractor_output", "candidate extractor returned invalid output"
 	case errors.Is(err, domain.ErrUnavailable):
 		status, code, message = http.StatusServiceUnavailable, "retrieval_unavailable", "retrieval is temporarily unavailable"
 	case errors.Is(err, context.DeadlineExceeded):

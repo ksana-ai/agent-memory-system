@@ -686,6 +686,125 @@ func TestPostgresStoreCreateCandidateWithMissingSourceRollsBack(t *testing.T) {
 	}
 }
 
+func TestPostgresStoreCreateCandidateBatchIsAtomicAndRevisionFenced(t *testing.T) {
+	ctx := context.Background()
+	databaseURL := requiredDatabaseURL(t)
+	applyMigrations(t, databaseURL)
+	tenantID, userID := uniqueScope("candidate_batch")
+	cleanupScopes(t, databaseURL, [][2]string{{tenantID, userID}})
+	storage := openStore(t, databaseURL)
+	defer storage.Close()
+
+	firstEvent := evidence(tenantID, userID, "event-batch-first", "first source", 1)
+	secondEvent := evidence(tenantID, userID, "event-batch-second", "second source", 2)
+	mustAppend(t, storage, firstEvent)
+	mustAppend(t, storage, secondEvent)
+	first := candidate(tenantID, userID, "candidate-batch-first", "first", "one", []string{firstEvent.ID}, 3)
+	second := candidate(tenantID, userID, "candidate-batch-second", "second", "two", []string{secondEvent.ID}, 4)
+	if err := storage.CreateCandidateBatch(ctx, storecontract.CandidateBatchCommand{
+		TenantID: tenantID, UserID: userID, ExpectedRevision: 0,
+		Candidates: []domain.MemoryCandidate{first, second},
+	}); err != nil {
+		t.Fatalf("create candidate batch: %v", err)
+	}
+	for _, value := range []domain.MemoryCandidate{first, second} {
+		loaded, err := storage.CandidateByID(ctx, tenantID, userID, value.ID)
+		if err != nil {
+			t.Fatalf("load candidate %q: %v", value.ID, err)
+		}
+		if loaded.Status != domain.CandidatePending || loaded.Review != nil || len(loaded.SourceEventIDs) != 1 || loaded.SourceEventIDs[0] != value.SourceEventIDs[0] {
+			t.Fatalf("loaded candidate %q=%#v", value.ID, loaded)
+		}
+	}
+	if revision, err := storage.ContextRevision(ctx, tenantID, userID); err != nil || revision != 0 {
+		t.Fatalf("revision after pending batch=%d error=%v, want 0", revision, err)
+	}
+
+	valid := candidate(tenantID, userID, "candidate-batch-valid-rollback", "valid", "valid", []string{firstEvent.ID}, 5)
+	missing := candidate(tenantID, userID, "candidate-batch-missing", "missing", "missing", []string{"event-missing"}, 6)
+	err := storage.CreateCandidateBatch(ctx, storecontract.CandidateBatchCommand{
+		TenantID: tenantID, UserID: userID, ExpectedRevision: 0,
+		Candidates: []domain.MemoryCandidate{valid, missing},
+	})
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("create batch with missing source error=%v, want not found", err)
+	}
+	for _, candidateID := range []string{valid.ID, missing.ID} {
+		if _, err := storage.CandidateByID(ctx, tenantID, userID, candidateID); !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("candidate %q after failed batch error=%v, want not found", candidateID, err)
+		}
+	}
+	assertTableRowCount(t, databaseURL, "memory_candidates", tenantID, userID, 2)
+	assertTableRowCount(t, databaseURL, "candidate_source_events", tenantID, userID, 2)
+
+	insertedBeforeFailure := candidate(
+		tenantID,
+		userID,
+		"candidate-batch-inserted-before-failure",
+		"inserted-before-failure",
+		"one",
+		[]string{firstEvent.ID},
+		7,
+	)
+	databaseRejected := candidate(
+		tenantID,
+		userID,
+		"candidate-batch-database-rejected",
+		"database-rejected",
+		"two",
+		[]string{secondEvent.ID},
+		8,
+	)
+	databaseRejected.Kind = domain.MemoryKind("unsupported-kind")
+	err = storage.CreateCandidateBatch(ctx, storecontract.CandidateBatchCommand{
+		TenantID: tenantID, UserID: userID, ExpectedRevision: 0,
+		Candidates: []domain.MemoryCandidate{insertedBeforeFailure, databaseRejected},
+	})
+	if err == nil {
+		t.Fatal("database constraint failure in second insert was accepted")
+	}
+	for _, candidateID := range []string{insertedBeforeFailure.ID, databaseRejected.ID} {
+		if _, err := storage.CandidateByID(ctx, tenantID, userID, candidateID); !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("candidate %q after mid-insert rollback error=%v, want not found", candidateID, err)
+		}
+	}
+	assertTableRowCount(t, databaseURL, "memory_candidates", tenantID, userID, 2)
+	assertTableRowCount(t, databaseURL, "candidate_source_events", tenantID, userID, 2)
+
+	wrongScope := candidate(tenantID, "other-user", "candidate-wrong-scope", "wrong", "wrong", []string{firstEvent.ID}, 9)
+	if err := storage.CreateCandidateBatch(ctx, storecontract.CandidateBatchCommand{
+		TenantID: tenantID, UserID: userID, ExpectedRevision: 0,
+		Candidates: []domain.MemoryCandidate{wrongScope},
+	}); !errors.Is(err, domain.ErrInvalid) {
+		t.Fatalf("create cross-scope batch error=%v, want invalid", err)
+	}
+
+	if _, err := storage.ForgetUser(ctx, tenantID, userID, fixtureTime(10)); err != nil {
+		t.Fatalf("forget user: %v", err)
+	}
+	replacement := firstEvent
+	replacement.SessionID = "replacement-session"
+	replacement.Content = "replacement source with reused id"
+	replacement.OccurredAt = fixtureTime(11)
+	replacement.RecordedAt = fixtureTime(11).Add(time.Millisecond)
+	mustAppend(t, storage, replacement)
+	stale := candidate(tenantID, userID, "candidate-stale-batch", "stale", "stale", []string{replacement.ID}, 12)
+	if err := storage.CreateCandidateBatch(ctx, storecontract.CandidateBatchCommand{
+		TenantID: tenantID, UserID: userID, ExpectedRevision: 0,
+		Candidates: []domain.MemoryCandidate{stale},
+	}); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("create stale batch after evidence id reuse error=%v, want conflict", err)
+	}
+	if _, err := storage.CandidateByID(ctx, tenantID, userID, stale.ID); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("stale candidate after revision conflict error=%v, want not found", err)
+	}
+	if err := storage.CreateCandidateBatch(ctx, storecontract.CandidateBatchCommand{
+		TenantID: tenantID, UserID: userID, ExpectedRevision: 0,
+	}); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("empty stale batch error=%v, want conflict", err)
+	}
+}
+
 func TestPostgresStoreApprovalEnqueuesOnlyEligibleProjectionTargetsAndRejectionDoesNotEnqueue(t *testing.T) {
 	ctx := context.Background()
 	databaseURL := requiredDatabaseURL(t)

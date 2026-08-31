@@ -11,8 +11,11 @@ HTTP API
    │
    ▼
 Application service ─────► Retriever port ────┬──► PostgreSQL FTS (default)
-   │                                          ├──► serving-pinned exact dense
-   ▼                                          └──► strict FTS+dense RRF hybrid
+   │                 │                        ├──► serving-pinned exact dense
+   │                 └──► Extractor port      └──► strict FTS+dense RRF hybrid
+   │                           │
+   │                           └──HTTP──► configured chat-completions model
+   ▼
 Store port ───────────────────────────────► PostgreSQL adapter
                                                   │
                                                   ▼
@@ -21,6 +24,10 @@ Store port ───────────────────────
 ```
 
 The server defaults to PostgreSQL full-text search. Migration 003 adds a STORED generated `tsvector`: memory key has weight A, value B, category/person/relationship C, and backstory D. A partial GIN index covers active cards. Plain query text is tokenized with the fixed `simple` configuration; the resulting lexemes are safely quoted and OR-combined before `ts_rank_cd` ranking. Scope, active status, and expiration are filtered in the same SQL statement, followed by deterministic `created_at`/ID tie-breaking. FTS mode never reads or probes the embedding endpoint.
+
+Automatic candidate extraction is a separate optional write path. `POST /v1/memory-candidate-extractions` accepts only 1 to 20 persisted evidence IDs; tenant and user remain server-controlled scope inputs from the existing headers. The service loads those events from that exact scope, fences the observed context revision, and limits their combined content to 64 KiB before making any provider request. The caller cannot select the endpoint, model, extractor identity, candidate status, or candidate fields through this request.
+
+The extractor port is provider-neutral. The current HTTP adapter uses strict JSON Schema response formatting over an OpenAI-compatible chat-completions protocol. `MEMORY_EXTRACTION_ENABLED` defaults to false. When true, the server requires `MEMORY_EXTRACTION_ENDPOINT`, `MEMORY_EXTRACTION_MODEL`, `MEMORY_EXTRACTION_EXTRACTOR_NAME`, and `MEMORY_EXTRACTION_EXTRACTOR_VERSION`. `MEMORY_EXTRACTION_AUTH_MODE` defaults to `none`; `bearer` additionally requires `MEMORY_EXTRACTION_BEARER_TOKEN`. `MEMORY_EXTRACTION_TIMEOUT` defaults to 10 seconds and may not exceed 120 seconds. The HTTP server sets its write timeout to at least that value plus five seconds. Disabled configuration is not read beyond the enable flag. The extractor sends only the selected evidence fields and performs no database writes. HTTP errors and model response bodies are classified into fixed application errors without retaining endpoint, credential, prompt, evidence, refusal text, or provider response content.
 
 Reviewed cards have durable projection, coverage, serving-selection, and explicit query paths:
 
@@ -68,11 +75,17 @@ Serviceable means active and either without `expires_at` or with `expires_at` st
 
 The PostgreSQL primary key is `(tenant_id, user_id, id)`, so a caller-chosen event ID can be reused safely in another scope. Candidate source links use a composite foreign key to prevent a cross-scope reference.
 
+The extraction trigger accepts an ordered, duplicate-free set of already-persisted evidence IDs. Missing and cross-scope IDs are indistinguishable at the API boundary. A request may carry at most 20 IDs and the loaded contents may total at most 64 KiB. Actor, session, occurrence time, ID, and content may leave the process for the configured model; arbitrary evidence metadata, tenant ID, and user ID are not part of the extractor request.
+
 ### Candidate
 
 `MemoryCandidate` is an untrusted proposal. It carries a memory kind, Advanced-JSON-Card-style fields, extractor identity/version, metadata, an optional absolute `expires_at`, and one or more ordered source event IDs. Creating it never makes it retrievable.
 
 The service performs an early source lookup for a useful API error. The PostgreSQL adapter repeats that validation while holding the scope transaction lock; correctness does not depend on the earlier check.
+
+There are two candidate creation paths. The compatibility endpoint accepts caller-authored fields. The automatic path accepts only evidence IDs and asks the configured model for zero to ten structured proposals. A proposal contains the candidate fields plus one or more supports. Each support must cite a requested evidence ID exactly once and include a valid UTF-8 quote of at most 1024 bytes that occurs verbatim in that evidence content. Unknown JSON fields, duplicate JSON keys, missing fields, unsupported kinds, field-limit violations, duplicate normalized identities, foreign sources, duplicate sources, and non-matching quotes invalidate the whole result.
+
+Exact quote containment is a deterministic provenance check, not proof that the candidate follows semantically from the quote or is true. Model output remains untrusted. The service supplies candidate IDs, tenant/user scope, `pending` status, extractor name/version, and bounded non-sensitive audit metadata; the model cannot choose them. Empty output is valid and creates no candidates.
 
 ### Memory card
 
@@ -103,6 +116,17 @@ The baseline uses exact cosine ordering through pgvector's `<=>` operator. Tenan
 ## Transaction and lock model
 
 `agent_memory.user_scope_state` is both a persistent context revision and the first lock acquired by every write for `(tenant_id, user_id)`. The row survives erasure, preventing revision ABA after the user later creates new data.
+
+Automatic extraction deliberately separates model I/O from persistence:
+
+1. Validate the caller scope and ordered source IDs, read the scope revision, load all evidence in that scope, and re-read the revision.
+2. Reject a changing scope or an input above the fixed total-content bound.
+3. Call the model without holding a PostgreSQL transaction, row lock, or scope lock.
+4. Parse and validate the complete structured response, including every candidate field, normalized identity, evidence reference, and verbatim quote. Allocate server-owned candidate and extraction IDs only after the response contract succeeds.
+5. Begin one scope-serialized batch transaction, require the original context revision, and revalidate every source through scoped foreign-key inputs.
+6. Insert every pending candidate and ordered source link, or roll back the complete batch.
+
+This revision fence handles the gap created by provider I/O. If erasure or another scope-changing lifecycle write commits after evidence was loaded, the batch fails with a conflict. If extraction commits first, a later erasure deletes the new candidates and their source links in its existing scope transaction. A timeout, refusal, transport error, invalid response, validation error, ID error, or persistence failure therefore creates no partial batch.
 
 Candidate creation runs in one transaction:
 
@@ -215,10 +239,13 @@ The initial migration installs pgvector. A second migration adds candidate/card 
 - `X-Tenant-ID` and `X-User-ID` are scope inputs, not authentication credentials. Loopback binding reduces exposure but is not authorization.
 - The reviewer ID and reason are audit fields supplied by the caller; reviewer independence is not verified.
 - Extracted content is data, never an instruction to execute tools.
+- Persisted evidence and model output are both untrusted data. Strict JSON Schema, duplicate-key rejection, same-scope source checks, and exact quote containment reduce ambiguity but do not establish semantic entailment, truth, or resistance to every prompt-injection technique. Only explicit review can create a serviceable card.
+- The optional extractor sends selected evidence content to its configured model endpoint. Plain HTTP is suitable only for a trusted loopback development service; remote use needs HTTPS plus explicit authentication, secrets, data-residency, retention, and deletion review. Provider work already in flight cannot be recalled by `ForgetUser`.
 - Database constraints and scoped SQL are the enforcement layer; prompt instructions are not a security boundary.
-- `/healthz` proves only that the process is alive. `/readyz` separately checks PostgreSQL and, for dense/hybrid mode, the configured serving pin plus public-probe behavior.
+- `/healthz` proves only that the process is alive. `/readyz` checks PostgreSQL and, for dense/hybrid mode, the configured serving pin plus public-probe behavior; it does not probe the optional extractor. Extractor disablement or runtime outage fails the extraction endpoint without changing the serviceability of already-reviewed cards.
 - Retrieval scores are ranking values, not truth confidence. FTS `ts_rank_cd`, cosine similarity, and RRF fused scores have different semantics and must not be interpreted as calibrated confidence.
 - Memory-card text leaves the process when the dense evaluator or projection worker calls its configured LM Studio endpoint; query text also leaves in online dense/hybrid mode. The client accepts only absolute HTTP(S) URLs without userinfo/query/fragment, follows no redirects, enforces timeout/input/batch/response limits, validates model/index/dimension/finite nonzero vectors, performs no implicit retry, and does not expose input, response bodies, or endpoints in errors or manifests. The worker continuously checks a fixed public probe in the same batch as each card document; the server does the same with each raw query, while durable worker retry happens only through a new fenced lease. Plain HTTP is intended only for the trusted loopback development endpoint; any future remote endpoint must use HTTPS and needs an explicit authentication/secrets design.
 - A first promotion sends only the fixed public probe before its database transaction; receipt replay sends nothing. The canonical operation UUID and non-secret space identifiers are logged with aggregate counts/generations/times, but DSNs, endpoints, model names, scope/card identifiers, card content, vectors, and provider responses are not. Space and operation identifiers are control-plane values by contract, not places for user content or secrets; generic storage validation does not prove that every historical space identifier is a hash.
 - Erasure prevents stale vector persistence but cannot recall provider I/O already in flight or physically erase a card document already copied into worker memory. The worker bounds local request waiting and refuses late persistence; it does not promise heap-memory zeroization or provider-side cancellation, retention, or deletion. The current development endpoint is loopback-only.
 - Cosine similarity and RRF are relevance rankings, not truth confidence. Server-process and evaluator evidence uses authored reviewed cards and is not proof of extraction quality, load behavior, remote-provider privacy, or production traffic.
+- The implemented developer trigger is an HTTP API over explicitly appended evidence. The repository has no chat, ticket, or other business ingestion connector; no automatic approval; and no MCP or gRPC server. Context Pack retrieval remains the existing HTTP operation.

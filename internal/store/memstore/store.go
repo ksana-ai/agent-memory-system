@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -110,6 +111,69 @@ func (s *Store) CreateCandidate(ctx context.Context, candidate domain.MemoryCand
 		}
 	}
 	s.candidates[candidate.ID] = cloneCandidate(candidate)
+	return nil
+}
+
+func (s *Store) CreateCandidateBatch(ctx context.Context, command store.CandidateBatchCommand) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	scope := userScope{tenantID: command.TenantID, userID: command.UserID}
+	if current := s.revisions[scope]; current != command.ExpectedRevision {
+		return fmt.Errorf(
+			"candidate batch expected context revision %d, current revision is %d: %w",
+			command.ExpectedRevision,
+			current,
+			domain.ErrConflict,
+		)
+	}
+	if strings.TrimSpace(command.TenantID) == "" || strings.TrimSpace(command.UserID) == "" {
+		return fmt.Errorf("candidate batch scope is required: %w", domain.ErrInvalid)
+	}
+
+	seenCandidateIDs := make(map[string]struct{}, len(command.Candidates))
+	for index, candidate := range command.Candidates {
+		if candidate.TenantID != command.TenantID || candidate.UserID != command.UserID {
+			return fmt.Errorf("candidate batch item %d scope does not match command scope: %w", index, domain.ErrInvalid)
+		}
+		if strings.TrimSpace(candidate.ID) == "" {
+			return fmt.Errorf("candidate batch item %d id is required: %w", index, domain.ErrInvalid)
+		}
+		if _, duplicate := seenCandidateIDs[candidate.ID]; duplicate {
+			return fmt.Errorf("candidate batch repeats candidate %q: %w", candidate.ID, domain.ErrInvalid)
+		}
+		seenCandidateIDs[candidate.ID] = struct{}{}
+		if _, exists := s.candidates[candidate.ID]; exists {
+			return fmt.Errorf("candidate %q: %w", candidate.ID, domain.ErrConflict)
+		}
+		if candidate.Status != domain.CandidatePending || candidate.Review != nil {
+			return fmt.Errorf("candidate %q must be pending and unreviewed: %w", candidate.ID, domain.ErrInvalid)
+		}
+		if len(candidate.SourceEventIDs) == 0 {
+			return fmt.Errorf("candidate %q has no source evidence: %w", candidate.ID, domain.ErrInvalid)
+		}
+		seenSourceIDs := make(map[string]struct{}, len(candidate.SourceEventIDs))
+		for _, eventID := range candidate.SourceEventIDs {
+			if strings.TrimSpace(eventID) == "" {
+				return fmt.Errorf("candidate %q has an empty source evidence id: %w", candidate.ID, domain.ErrInvalid)
+			}
+			if _, duplicate := seenSourceIDs[eventID]; duplicate {
+				return fmt.Errorf("candidate %q repeats source evidence %q: %w", candidate.ID, eventID, domain.ErrInvalid)
+			}
+			seenSourceIDs[eventID] = struct{}{}
+			if _, exists := s.evidence[evidenceKey{tenantID: command.TenantID, userID: command.UserID, eventID: eventID}]; !exists {
+				return fmt.Errorf("candidate %q source evidence %q: %w", candidate.ID, eventID, domain.ErrNotFound)
+			}
+		}
+	}
+
+	for _, candidate := range command.Candidates {
+		s.candidates[candidate.ID] = cloneCandidate(candidate)
+	}
 	return nil
 }
 

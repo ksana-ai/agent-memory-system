@@ -1,12 +1,13 @@
 openapi: 3.1.0
 info:
   title: Go Agent Memory System API
-  version: 0.2.0
+  version: 0.3.0
   description: >-
     Durable-storage API backed by PostgreSQL. X-Tenant-ID and X-User-ID select
     a scope but are not authentication credentials. Request bodies are capped
     at 65536 bytes; x-max-bytes documents UTF-8 byte limits enforced by the
-    server.
+    server. Automatic extraction converts persisted same-scope evidence into
+    pending candidates; it never approves or exposes them through retrieval.
 servers:
   - url: http://localhost:8080
 paths:
@@ -26,7 +27,8 @@ paths:
       operationId: readiness
       description: >-
         Queries PostgreSQL and, for an explicitly configured dense or hybrid
-        mode, verifies the serving-space pin and embedding public probe.
+        mode, verifies the serving-space pin and embedding public probe. This
+        endpoint does not probe the optional candidate extractor.
       responses:
         "200":
           description: All dependencies for the configured retrieval mode are reachable and match the serving pin
@@ -61,6 +63,41 @@ paths:
                 $ref: "#/components/schemas/EvidenceEvent"
         "400": {$ref: "#/components/responses/BadRequest"}
         "409": {$ref: "#/components/responses/Conflict"}
+  /v1/memory-candidate-extractions:
+    post:
+      operationId: extractMemoryCandidates
+      description: >-
+        Loads 1 to 20 persisted evidence events from the caller's tenant/user
+        scope, invokes the process-configured structured extractor, validates
+        the complete untrusted result, and atomically creates zero to ten
+        pending candidates. Loaded evidence content is capped at 65536 bytes
+        in total. Every candidate support must cite one requested event and
+        contain a quote of at most 1024 bytes that occurs verbatim in that
+        event. Exact quote containment proves mechanical traceability, not
+        semantic entailment. Only the separate explicit review operation can
+        make a candidate retrievable.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/UserID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExtractCandidatesRequest"
+      responses:
+        "200":
+          description: Extraction completed; candidates may be empty and are always pending
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtractCandidatesResponse"
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "502": {$ref: "#/components/responses/ExtractionBadGateway"}
+        "503": {$ref: "#/components/responses/ExtractionUnavailable"}
+        "504": {$ref: "#/components/responses/RequestTimeout"}
   /v1/memory-candidates:
     post:
       operationId: proposeMemoryCandidate
@@ -184,8 +221,24 @@ components:
       content:
         application/json:
           schema: {$ref: "#/components/schemas/Error"}
+    ExtractionBadGateway:
+      description: >-
+        The configured extractor explicitly rejected the request or returned a
+        response that failed the strict structured-output contract. The fixed
+        error code is extraction_rejected or invalid_extractor_output.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    ExtractionUnavailable:
+      description: >-
+        Candidate extraction is disabled or its configured provider is
+        temporarily unavailable. The fixed error code is extraction_disabled
+        or extraction_unavailable.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
     RequestTimeout:
-      description: Retrieval did not complete before the request deadline
+      description: The requested retrieval or extraction did not complete before its deadline
       content:
         application/json:
           schema: {$ref: "#/components/schemas/Error"}
@@ -219,6 +272,17 @@ components:
           additionalProperties: {type: string, x-max-bytes: 1024}
           maxProperties: 32
         occurred_at: {type: string, format: date-time}
+    ExtractCandidatesRequest:
+      type: object
+      additionalProperties: false
+      required: [source_event_ids]
+      properties:
+        source_event_ids:
+          type: array
+          minItems: 1
+          maxItems: 20
+          uniqueItems: true
+          items: {type: string, x-max-bytes: 128}
     ProposeCandidateRequest:
       type: object
       additionalProperties: false
@@ -307,6 +371,36 @@ components:
         metadata:
           type: object
           additionalProperties: {type: string}
+    ExtractorDescriptor:
+      type: object
+      additionalProperties: false
+      required: [name, version]
+      properties:
+        name: {type: string}
+        version: {type: string}
+    ExtractCandidatesResponse:
+      type: object
+      additionalProperties: false
+      required: [extraction_id, source_event_ids, extractor, candidates]
+      properties:
+        extraction_id: {type: string}
+        source_event_ids:
+          type: array
+          minItems: 1
+          maxItems: 20
+          uniqueItems: true
+          items: {type: string}
+        extractor: {$ref: "#/components/schemas/ExtractorDescriptor"}
+        candidates:
+          type: array
+          minItems: 0
+          maxItems: 10
+          items:
+            allOf:
+              - $ref: "#/components/schemas/MemoryCandidate"
+              - type: object
+                properties:
+                  status: {type: string, const: pending}
     MemoryCard:
       type: object
       required: [id, candidate_id, tenant_id, user_id, kind, category, key, value, source_event_ids, version, status, created_at]
