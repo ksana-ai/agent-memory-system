@@ -21,10 +21,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/kai443/go-agent-memory-system/internal/domain"
-	"github.com/kai443/go-agent-memory-system/internal/embedding"
-	storecontract "github.com/kai443/go-agent-memory-system/internal/store"
-	"github.com/kai443/go-agent-memory-system/internal/store/postgres"
+	"github.com/ksana-ai/agent-memory-system/internal/domain"
+	"github.com/ksana-ai/agent-memory-system/internal/embedding"
+	storecontract "github.com/ksana-ai/agent-memory-system/internal/store"
+	"github.com/ksana-ai/agent-memory-system/internal/store/postgres"
 )
 
 const (

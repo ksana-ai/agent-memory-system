@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kai443/go-agent-memory-system/internal/domain"
-	"github.com/kai443/go-agent-memory-system/internal/store"
-	"github.com/kai443/go-agent-memory-system/internal/store/postgres"
+	"github.com/ksana-ai/agent-memory-system/internal/domain"
+	"github.com/ksana-ai/agent-memory-system/internal/store"
+	"github.com/ksana-ai/agent-memory-system/internal/store/postgres"
 )
 
 const ArmReviewedCardsPostgresFTSV1 = "reviewed-cards-postgres-fts-v1"

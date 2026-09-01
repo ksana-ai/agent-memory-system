@@ -14,13 +14,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kai443/go-agent-memory-system/internal/api"
-	"github.com/kai443/go-agent-memory-system/internal/app"
-	"github.com/kai443/go-agent-memory-system/internal/embedding"
-	"github.com/kai443/go-agent-memory-system/internal/extraction"
-	"github.com/kai443/go-agent-memory-system/internal/migrations"
-	"github.com/kai443/go-agent-memory-system/internal/retrieval"
-	"github.com/kai443/go-agent-memory-system/internal/store/postgres"
+	"github.com/ksana-ai/agent-memory-system/internal/api"
+	"github.com/ksana-ai/agent-memory-system/internal/app"
+	"github.com/ksana-ai/agent-memory-system/internal/embedding"
+	"github.com/ksana-ai/agent-memory-system/internal/extraction"
+	"github.com/ksana-ai/agent-memory-system/internal/migrations"
+	"github.com/ksana-ai/agent-memory-system/internal/retrieval"
+	"github.com/ksana-ai/agent-memory-system/internal/store/postgres"
 )
 
 const (

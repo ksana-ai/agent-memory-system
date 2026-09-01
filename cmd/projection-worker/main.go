@@ -12,12 +12,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kai443/go-agent-memory-system/internal/domain"
-	"github.com/kai443/go-agent-memory-system/internal/embedding"
-	"github.com/kai443/go-agent-memory-system/internal/id"
-	"github.com/kai443/go-agent-memory-system/internal/migrations"
-	"github.com/kai443/go-agent-memory-system/internal/projectionworker"
-	"github.com/kai443/go-agent-memory-system/internal/store/postgres"
+	"github.com/ksana-ai/agent-memory-system/internal/domain"
+	"github.com/ksana-ai/agent-memory-system/internal/embedding"
+	"github.com/ksana-ai/agent-memory-system/internal/id"
+	"github.com/ksana-ai/agent-memory-system/internal/migrations"
+	"github.com/ksana-ai/agent-memory-system/internal/projectionworker"
+	"github.com/ksana-ai/agent-memory-system/internal/store/postgres"
 )
 
 const (

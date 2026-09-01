@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kai443/go-agent-memory-system/internal/app"
-	"github.com/kai443/go-agent-memory-system/internal/domain"
+	"github.com/ksana-ai/agent-memory-system/internal/app"
+	"github.com/ksana-ai/agent-memory-system/internal/domain"
 )
 
 const maxRequestBytes = 64 << 10

@@ -20,6 +20,8 @@ jobs:
         run: make verify
       - name: Verify PostgreSQL lifecycle
         run: make verify-postgres
+      - name: Verify candidate extraction
+        run: make verify-extraction
       - name: Stop PostgreSQL
         if: always()
         run: docker compose down --volumes

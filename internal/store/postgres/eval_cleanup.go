@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/kai443/go-agent-memory-system/internal/domain"
+	"github.com/ksana-ai/agent-memory-system/internal/domain"
 )
 
 const evaluationScopePrefix = "eval_"

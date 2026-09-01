@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kai443/go-agent-memory-system/internal/domain"
-	"github.com/kai443/go-agent-memory-system/internal/retrieval"
-	"github.com/kai443/go-agent-memory-system/internal/store"
-	"github.com/kai443/go-agent-memory-system/internal/store/memstore"
-	"github.com/kai443/go-agent-memory-system/internal/store/postgres"
+	"github.com/ksana-ai/agent-memory-system/internal/domain"
+	"github.com/ksana-ai/agent-memory-system/internal/retrieval"
+	"github.com/ksana-ai/agent-memory-system/internal/store"
+	"github.com/ksana-ai/agent-memory-system/internal/store/memstore"
+	"github.com/ksana-ai/agent-memory-system/internal/store/postgres"
 )
 
 func TestPostgresFTSNamespaceRestoresLogicalScopeAndCleansPhysicalScope(t *testing.T) {

@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/kai443/go-agent-memory-system/internal/domain"
-	"github.com/kai443/go-agent-memory-system/internal/embedding"
+	"github.com/ksana-ai/agent-memory-system/internal/domain"
+	"github.com/ksana-ai/agent-memory-system/internal/embedding"
 )
 
 const (

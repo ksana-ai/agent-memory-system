@@ -12,7 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/puddle/v2"
-	"github.com/kai443/go-agent-memory-system/internal/domain"
+	"github.com/ksana-ai/agent-memory-system/internal/domain"
 )
 
 func TestValidateRegisterProjectionTargetCanonicalizesPublicMetadata(t *testing.T) {

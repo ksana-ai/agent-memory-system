@@ -2,6 +2,11 @@
 
 [English](README.md) | [中文](README_zh.md)
 
+**版本：** `v0.1.0-alpha` —— 用于本地评估的实验性软件，尚未达到生产可用状态。
+
+> [!WARNING]
+> HTTP API 尚未实现认证和授权。`X-Tenant-ID`、`X-User-ID` 与 reviewer ID 都是调用方传入的 selector，不是可信身份。请仅在可信 loopback 或隔离的开发网络中运行，不要直接暴露到公网。
+
 这是一个 Go 原生、证据优先的 Agent 长期记忆服务。它把原始证据、未经信任的记忆候选、经过显式审核的版本化 Memory Card，以及单次请求使用的 Context Pack 分成不同层次。
 
 > **当前状态：已实现 PostgreSQL 持久化生命周期、可选的结构化 evidence 自动抽取，以及显式选择的 FTS、Dense 和 Hybrid 检索路径。** 自动抽取只能把已持久化的 evidence 转换成带来源的 `pending` 候选，不能自动批准。默认检索仍是 PostgreSQL FTS，不依赖抽取模型或 embedding 模型。这些结论来自本地组件和进程测试，不代表生产部署、抽取准确率、事实校验能力、ANN/负载结果或可用性 SLA。
@@ -307,3 +312,9 @@ compose.yaml                 本地 PostgreSQL/pgvector
 5. 如业务确有需要，再单独设计聊天/工单采集连接器或 MCP/gRPC；不能把它们写成当前已实现能力。
 
 规划项不能被表述为已经完成或生产上线。
+
+## 贡献、安全与许可证
+
+欢迎按照 [`CONTRIBUTING.md`](CONTRIBUTING.md) 提交贡献。安全问题请根据 [`SECURITY.md`](SECURITY.md) 私下报告；参与项目社区时请遵守 [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)。版本变化记录在 [`CHANGELOG.md`](CHANGELOG.md)。
+
+本项目采用 [MIT License](LICENSE)。

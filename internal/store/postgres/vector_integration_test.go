@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/kai443/go-agent-memory-system/internal/domain"
-	storecontract "github.com/kai443/go-agent-memory-system/internal/store"
-	"github.com/kai443/go-agent-memory-system/internal/store/postgres"
+	"github.com/ksana-ai/agent-memory-system/internal/domain"
+	storecontract "github.com/ksana-ai/agent-memory-system/internal/store"
+	"github.com/ksana-ai/agent-memory-system/internal/store/postgres"
 )
 
 const vectorTestSpace = "lmstudio:text-embedding-bge-m3:memory-card-v1"

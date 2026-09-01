@@ -9,7 +9,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/kai443/go-agent-memory-system/internal/migrations"
+	"github.com/ksana-ai/agent-memory-system/internal/migrations"
 )
 
 func main() {

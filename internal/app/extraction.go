@@ -9,9 +9,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/kai443/go-agent-memory-system/internal/domain"
-	"github.com/kai443/go-agent-memory-system/internal/extraction"
-	"github.com/kai443/go-agent-memory-system/internal/store"
+	"github.com/ksana-ai/agent-memory-system/internal/domain"
+	"github.com/ksana-ai/agent-memory-system/internal/extraction"
+	"github.com/ksana-ai/agent-memory-system/internal/store"
 )
 
 const (

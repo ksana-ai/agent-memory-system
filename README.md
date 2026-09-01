@@ -4,6 +4,11 @@
 
 A Go-native, evidence-first memory service for agents. It separates raw conversation evidence, untrusted memory proposals, reviewed/versioned memory cards, and the Context Pack assembled for one request.
 
+**Release:** `v0.1.0-alpha` — experimental local evaluation software, not production-ready.
+
+> [!WARNING]
+> The HTTP API does not implement authentication or authorization. `X-Tenant-ID`, `X-User-ID`, and reviewer IDs are caller-supplied selectors, not trusted identities. Keep the service on a trusted loopback or isolated development network; do not expose it directly to the public internet.
+
 > **Current status: durable PostgreSQL lifecycle plus an opt-in structured evidence extractor and explicit FTS, dense, and hybrid server modes.** The extractor turns already-persisted evidence into untrusted, source-grounded `pending` candidates; it never approves them. PostgreSQL FTS remains the default retrieval mode and does not depend on either model endpoint. These are accepted local component/process paths, not a production deployment, extraction-quality guarantee, fact verifier, ANN/load result, or availability SLA.
 
 ## Why this project exists
@@ -341,3 +346,9 @@ compose.yaml                 Local PostgreSQL/pgvector service
 Planned work must not be represented as completed or production-deployed capability.
 
 Business-side automatic evidence collection, chat/ticket connectors, automatic approval, authenticated principals, MCP/direct retrieval, and gRPC are not implemented.
+
+## Contributing, security, and license
+
+Contributions are welcome under the process in [`CONTRIBUTING.md`](CONTRIBUTING.md). Please report security issues privately as described in [`SECURITY.md`](SECURITY.md), and follow the [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) in project spaces. Release history is recorded in [`CHANGELOG.md`](CHANGELOG.md).
+
+This project is licensed under the [MIT License](LICENSE).

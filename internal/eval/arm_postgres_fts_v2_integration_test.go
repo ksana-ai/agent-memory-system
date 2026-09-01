@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/kai443/go-agent-memory-system/internal/migrations"
-	"github.com/kai443/go-agent-memory-system/internal/store/postgres"
+	"github.com/ksana-ai/agent-memory-system/internal/migrations"
+	"github.com/ksana-ai/agent-memory-system/internal/store/postgres"
 )
 
 func TestPostgresFTSArmRunsRepeatedlyAndRemovesPhysicalScope(t *testing.T) {

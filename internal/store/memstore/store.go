@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kai443/go-agent-memory-system/internal/domain"
-	"github.com/kai443/go-agent-memory-system/internal/store"
+	"github.com/ksana-ai/agent-memory-system/internal/domain"
+	"github.com/ksana-ai/agent-memory-system/internal/store"
 )
 
 type Store struct {

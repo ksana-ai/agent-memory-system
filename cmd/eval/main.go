@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	memoryeval "github.com/kai443/go-agent-memory-system/internal/eval"
+	memoryeval "github.com/ksana-ai/agent-memory-system/internal/eval"
 )
 
 func main() {

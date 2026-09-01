@@ -8,12 +8,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kai443/go-agent-memory-system/internal/api"
-	"github.com/kai443/go-agent-memory-system/internal/app"
-	"github.com/kai443/go-agent-memory-system/internal/domain"
-	"github.com/kai443/go-agent-memory-system/internal/extraction"
-	"github.com/kai443/go-agent-memory-system/internal/retrieval"
-	"github.com/kai443/go-agent-memory-system/internal/store/memstore"
+	"github.com/ksana-ai/agent-memory-system/internal/api"
+	"github.com/ksana-ai/agent-memory-system/internal/app"
+	"github.com/ksana-ai/agent-memory-system/internal/domain"
+	"github.com/ksana-ai/agent-memory-system/internal/extraction"
+	"github.com/ksana-ai/agent-memory-system/internal/retrieval"
+	"github.com/ksana-ai/agent-memory-system/internal/store/memstore"
 )
 
 func TestHTTPAutomaticExtractionRequiresReviewBeforeRetrieval(t *testing.T) {

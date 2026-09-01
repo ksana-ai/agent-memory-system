@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kai443/go-agent-memory-system/internal/domain"
+	"github.com/ksana-ai/agent-memory-system/internal/domain"
 )
 
 func TestMemoryCardDocumentV1ChineseGoldenAndSHA256(t *testing.T) {

@@ -11,7 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/kai443/go-agent-memory-system/internal/domain"
+	"github.com/ksana-ai/agent-memory-system/internal/domain"
 )
 
 const DatasetSchemaVersionV2 = "2"

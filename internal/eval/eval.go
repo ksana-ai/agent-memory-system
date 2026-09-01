@@ -13,10 +13,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kai443/go-agent-memory-system/internal/app"
-	"github.com/kai443/go-agent-memory-system/internal/domain"
-	"github.com/kai443/go-agent-memory-system/internal/retrieval"
-	"github.com/kai443/go-agent-memory-system/internal/store/memstore"
+	"github.com/ksana-ai/agent-memory-system/internal/app"
+	"github.com/ksana-ai/agent-memory-system/internal/domain"
+	"github.com/ksana-ai/agent-memory-system/internal/retrieval"
+	"github.com/ksana-ai/agent-memory-system/internal/store/memstore"
 )
 
 const DatasetSchemaVersion = "1"

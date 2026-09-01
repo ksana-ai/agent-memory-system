@@ -1,4 +1,4 @@
-module github.com/kai443/go-agent-memory-system
+module github.com/ksana-ai/agent-memory-system
 
 go 1.25.0
 

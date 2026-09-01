@@ -15,8 +15,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/kai443/go-agent-memory-system/internal/domain"
-	domainstore "github.com/kai443/go-agent-memory-system/internal/store"
+	"github.com/ksana-ai/agent-memory-system/internal/domain"
+	domainstore "github.com/ksana-ai/agent-memory-system/internal/store"
 )
 
 // Store persists the complete memory lifecycle in PostgreSQL.
